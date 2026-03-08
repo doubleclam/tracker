@@ -24,14 +24,14 @@ FACTOR_CONFIG = {
     "I. Macro-Monetary Drivers": [
         {"ind": "1. US Real Rates (10Y TIPS)", "ticker": "DFII10", "source": "FRED", "weight": 5, "higher_is_bullish": False, "why": "High real yield competes with metals."},
         {"ind": "1A. Fed Funds Real Rate", "ticker": "FEDFUNDS_REAL", "source": "SIMULATED", "weight": 4, "higher_is_bullish": False, "why": "Negative real rates are historically bullish."},
-        {"ind": "1B. 2Y Real Rates", "ticker": "DFII2", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Impacts short-term carrying costs."},
+        {"ind": "1B. 5Y Real Rates", "ticker": "DFII5", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Impacts medium-term carrying costs."},
         {"ind": "1C. Global Real Rates (Weighted)", "ticker": "GLB_REAL", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Global opportunity cost."},
         {"ind": "2. Breakeven Inflation (5Y)", "ticker": "T5YIE", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Market-implied inflation expectation."},
         {"ind": "2A. UMich Inflation Expectations", "ticker": "MICH", "source": "FRED", "weight": 2, "higher_is_bullish": True, "why": "Consumer inflation sentiment."},
         {"ind": "2B. Cleveland Fed Nowcast", "ticker": "CLEV_INFL", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "High-frequency inflation indicator."},
         {"ind": "3. Global Liquidity (M2)", "ticker": "M2SL", "source": "FRED", "weight": 5, "higher_is_bullish": True, "why": "Expansions in M2 debase fiat currencies."},
         {"ind": "3A. US Debt/GDP Ratio", "ticker": "GFDEGDQ188S", "source": "FRED", "weight": 4, "higher_is_bullish": True, "why": "Unsustainable debt implies future monetization."},
-        {"ind": "3B. Deficit as % of GDP", "ticker": "FYFSGDA188S", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Accelerating deficits weaken currency."},
+        {"ind": "3B. Deficit as % of GDP", "ticker": "FYFSGDA188S", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Larger deficits (more negative) weaken currency, bullish for gold."},
         {"ind": "3C. Debt Service Costs", "ticker": "A091RC1Q027SBEA", "source": "FRED", "weight": 4, "higher_is_bullish": True, "why": "Forces central banks into yield curve control."},
         {"ind": "4. Nominal Yield Curve", "ticker": "T10Y2Y", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Steepening indicates normalization."},
         {"ind": "5. Currency Strength (DXY)", "ticker": "DX-Y.NYB", "source": "YF", "weight": 5, "higher_is_bullish": False, "why": "Inverse correlation to USD pricing."},
@@ -112,84 +112,212 @@ def fetch_historical_data():
     """Fetches 5 years of daily/monthly history to calculate true Z-Scores for all 47 factors"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=5*365)
-    
+
     hist_data = {}
-    
+    fetch_errors = []
+
     # 1. Fetch FRED Data
     if fred:
-        fred_tickers = ["DFII10", "DFII2", "T5YIE", "MICH", "M2SL", "GFDEGDQ188S", "FYFSGDA188S", "A091RC1Q027SBEA", "T10Y2Y", "BAMLH0A0HYM2", "TEDRATE", "RRPONTSYD", "TOTRESNS"]
+        fred_tickers = [
+            "DFII10", "DFII5", "T5YIE", "MICH", "M2SL", "GFDEGDQ188S",
+            "FYFSGDA188S", "A091RC1Q027SBEA", "T10Y2Y", "BAMLH0A0HYM2",
+            "TEDRATE", "RRPONTSYD", "TOTRESNS"
+        ]
         for t in fred_tickers:
             try:
                 series = fred.get_series(t, observation_start=start_date)
-                hist_data[t] = series.dropna()
-            except: pass
-            
-    # 2. Fetch Yahoo Finance Data
-    yf_tickers = ["DX-Y.NYB", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F", "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ"]
-    try:
-        yf_df = yf.download(yf_tickers, start=start_date, end=end_date, progress=False)['Close']
-        for t in yf_tickers:
-            hist_data[t] = yf_df[t].dropna()
-            
-        # Compute Ratios dynamically
-        hist_data["GC=F/SI=F"] = (yf_df["GC=F"] / yf_df["SI=F"]).dropna()
-        hist_data["GC=F/CL=F"] = (yf_df["GC=F"] / yf_df["CL=F"]).dropna()
-        hist_data["GC=F/^GSPC"] = (yf_df["GC=F"] / yf_df["^GSPC"]).dropna()
-        hist_data["PL=F/GC=F"] = (yf_df["PL=F"] / yf_df["GC=F"]).dropna()
-        hist_data["GC=F/BTC-USD"] = (yf_df["GC=F"] / yf_df["BTC-USD"]).dropna()
-        hist_data["GC=F/VNQ"] = (yf_df["GC=F"] / yf_df["VNQ"]).dropna()
-        hist_data["GDX/GLD"] = (yf_df["GDX"] / yf_df["GLD"]).dropna()
-        hist_data["GDXJ/GDX"] = (yf_df["GDXJ"] / yf_df["GDX"]).dropna()
-    except: pass
+                s = series.dropna()
+                if len(s) > 0:
+                    hist_data[t] = s
+                else:
+                    fetch_errors.append(f"FRED {t}: returned empty series")
+            except Exception as e:
+                fetch_errors.append(f"FRED {t}: {e}")
 
-    # 3. Mathematically Simulate 5Y History for Esoteric/Scraped Factors
-    # This guarantees the stats engine won't crash on manual/paywalled factors.
-    np.random.seed(int(end_date.strftime("%d"))) # Rotates the random seed daily
+        # Compute Fed Funds Real Rate = FEDFUNDS - T5YIE (inflation expectations)
+        try:
+            fedfunds = fred.get_series("FEDFUNDS", observation_start=start_date).dropna()
+            t5yie = hist_data.get("T5YIE")
+            if t5yie is not None and len(fedfunds) > 0:
+                # Align monthly fed funds to daily inflation expectations
+                fedfunds_daily = fedfunds.reindex(t5yie.index, method="ffill")
+                real_ff = (fedfunds_daily - t5yie).dropna()
+                if len(real_ff) > 10:
+                    hist_data["FEDFUNDS_REAL"] = real_ff
+        except Exception as e:
+            fetch_errors.append(f"FEDFUNDS_REAL calc: {e}")
+
+        # Compute Gold/M2 ratio
+        try:
+            m2 = hist_data.get("M2SL")
+            if m2 is not None:
+                m2_daily = m2.resample("D").ffill()
+                hist_data["_M2_DAILY"] = m2_daily  # store for ratio calc later
+        except Exception as e:
+            fetch_errors.append(f"M2 resample: {e}")
+
+        # Compute Deficit/GDP: FRED stores as negative for deficit.
+        # We want "bigger deficit = more bullish for gold", so we negate it
+        # so that a larger deficit (e.g. -6%) becomes +6 and scores as bullish.
+        if "FYFSGDA188S" in hist_data:
+            hist_data["FYFSGDA188S"] = -hist_data["FYFSGDA188S"]
+
+    # 2. Fetch Yahoo Finance Data
+    yf_tickers = [
+        "DX-Y.NYB", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
+        "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ",
+        "PA=F", "HG=F"
+    ]
+    try:
+        yf_df = yf.download(yf_tickers, start=start_date, end=end_date, progress=False)
+
+        # Handle both MultiIndex and flat column formats
+        if isinstance(yf_df.columns, pd.MultiIndex):
+            close_df = yf_df["Close"]
+        else:
+            close_df = yf_df
+
+        for t in yf_tickers:
+            if t in close_df.columns:
+                s = close_df[t].dropna()
+                if len(s) > 0:
+                    hist_data[t] = s
+                else:
+                    fetch_errors.append(f"YF {t}: no data after dropna")
+            else:
+                fetch_errors.append(f"YF {t}: not in downloaded columns")
+
+        # Compute Ratios dynamically
+        ratio_pairs = {
+            "GC=F/SI=F": ("GC=F", "SI=F"),
+            "GC=F/CL=F": ("GC=F", "CL=F"),
+            "GC=F/^GSPC": ("GC=F", "^GSPC"),
+            "PL=F/GC=F": ("PL=F", "GC=F"),
+            "GC=F/BTC-USD": ("GC=F", "BTC-USD"),
+            "GC=F/VNQ": ("GC=F", "VNQ"),
+            "GDX/GLD": ("GDX", "GLD"),
+            "GDXJ/GDX": ("GDXJ", "GDX"),
+        }
+        for ratio_name, (num, den) in ratio_pairs.items():
+            if num in close_df.columns and den in close_df.columns:
+                ratio = (close_df[num] / close_df[den]).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(ratio) > 10:
+                    hist_data[ratio_name] = ratio
+                else:
+                    fetch_errors.append(f"Ratio {ratio_name}: insufficient data ({len(ratio)} pts)")
+
+        # Compute Gold/M2 ratio from real data
+        if "GC=F" in hist_data and "_M2_DAILY" in hist_data:
+            gc = hist_data["GC=F"]
+            m2d = hist_data["_M2_DAILY"]
+            aligned = pd.concat([gc, m2d], axis=1).dropna()
+            if len(aligned) > 10:
+                hist_data["AU_M2"] = (aligned.iloc[:, 0] / aligned.iloc[:, 1]).dropna()
+
+        # Compute Silver Beta (60-day rolling beta of SI vs GC)
+        if "SI=F" in hist_data and "GC=F" in hist_data:
+            si_ret = hist_data["SI=F"].pct_change().dropna()
+            gc_ret = hist_data["GC=F"].pct_change().dropna()
+            aligned = pd.concat([si_ret, gc_ret], axis=1).dropna()
+            aligned.columns = ["SI", "GC"]
+            if len(aligned) > 60:
+                rolling_cov = aligned["SI"].rolling(60).cov(aligned["GC"])
+                rolling_var = aligned["GC"].rolling(60).var()
+                beta = (rolling_cov / rolling_var).dropna()
+                if len(beta) > 10:
+                    hist_data["SI_BETA"] = beta
+
+        # Compute Moving Average signal (price above 50D & 200D = bullish)
+        if "GC=F" in hist_data:
+            gc = hist_data["GC=F"]
+            ma50 = gc.rolling(50).mean()
+            ma200 = gc.rolling(200).mean()
+            # Score: 2 if above both, 1 if above one, 0 if below both
+            ma_signal = ((gc > ma50).astype(float) + (gc > ma200).astype(float)).dropna()
+            if len(ma_signal) > 200:
+                hist_data["MA_BULL"] = ma_signal
+
+        # Compute RSI (14-day) for gold
+        if "GC=F" in hist_data:
+            gc = hist_data["GC=F"]
+            delta = gc.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            rsi = rsi.dropna()
+            if len(rsi) > 10:
+                hist_data["RSI_DIV"] = rsi
+
+        # Compute Bollinger Band width for gold
+        if "GC=F" in hist_data:
+            gc = hist_data["GC=F"]
+            bb_mid = gc.rolling(20).mean()
+            bb_std = gc.rolling(20).std()
+            bb_width = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / bb_mid * 100
+            bb_width = bb_width.dropna()
+            if len(bb_width) > 10:
+                hist_data["BB_EXP"] = bb_width
+
+    except Exception as e:
+        fetch_errors.append(f"YF bulk download: {e}")
+
+    # 3. Simulate remaining factors that have no free API source
+    # These use random walks as placeholders until real data sources are connected.
+    np.random.seed(int(end_date.strftime("%d")))
     dates = pd.date_range(start=start_date, end=end_date, freq='B')
-    
+
+    simulated_count = 0
     for category in FACTOR_CONFIG.values():
         for item in category:
-            if item['source'] == 'SIMULATED':
-                # Create a normalized historical random walk array 
+            ticker = item['ticker']
+            if item['source'] == 'SIMULATED' and ticker not in hist_data:
                 steps = np.random.normal(loc=0.01, scale=1.5, size=len(dates))
                 walk = np.cumsum(steps)
-                # Offset to prevent negative arrays for baseline ratios
-                walk = (walk - walk.min()) + 5.0 
-                hist_data[item['ticker']] = pd.Series(walk, index=dates)
-    
+                walk = (walk - walk.min()) + 5.0
+                hist_data[ticker] = pd.Series(walk, index=dates)
+                simulated_count += 1
+
+    # Store metadata for display
+    hist_data["_fetch_errors"] = fetch_errors
+    hist_data["_simulated_count"] = simulated_count
+
     return hist_data
 
 def calculate_statistics(series, config):
     """Dynamically calculates 5Y Mean, Std, Z-Score, and Confidence Scores"""
     if series is None or len(series) < 10:
         return {"Value": "N/A", "Colour Indicator": "Yellow", "Total Factor Score": 0}
-        
-    current_val = series.iloc[-1]
-    mean_5y = series.mean()
-    std_5y = series.std()
-    
+
+    current_val = float(series.iloc[-1])
+    mean_5y = float(series.mean())
+    std_5y = float(series.std())
+
     # Mathematical Z-Score Formula: (Current - Mean) / Std
-    z_score = (current_val - mean_5y) / std_5y if std_5y != 0 else 0
-    
+    z_score = (current_val - mean_5y) / std_5y if std_5y != 0 else 0.0
+
     # Percentile
-    percentile = (series < current_val).mean() * 100
-    
+    percentile = float((series < current_val).mean() * 100)
+
     # Directional Scoring
     weight = config['weight']
     is_bullish = config['higher_is_bullish']
-    
+
     if is_bullish:
         raw_score = z_score * weight
     else:
         raw_score = -z_score * weight
-        
-    # Cap maximum scores structurally 
+
+    # Cap maximum scores structurally
     factor_score = max(min(raw_score, weight * 3), -weight * 3)
-    
-    if factor_score > (weight * 0.5): color = "Green"
-    elif factor_score < -(weight * 0.5): color = "Red"
-    else: color = "Yellow"
-    
+
+    if factor_score > (weight * 0.5):
+        color = "Green"
+    elif factor_score < -(weight * 0.5):
+        color = "Red"
+    else:
+        color = "Yellow"
+
     return {
         "Value": f"{current_val:.2f}",
         "5Y Mean": f"{mean_5y:.2f}",
@@ -207,20 +335,34 @@ st.markdown(f"**Report Timestamp:** {datetime.now().strftime('%A, %B %d, %Y at %
 
 with st.spinner("Downloading 5 years of API market history & computing live Z-Scores for all 47 factors..."):
     historical_data = fetch_historical_data()
-    
+
+    # Show data quality info
+    fetch_errors = historical_data.get("_fetch_errors", [])
+    simulated_count = historical_data.get("_simulated_count", 0)
+
     report_data = []
-    
+
     for category, indicators in FACTOR_CONFIG.items():
         for item in indicators:
             ticker = item['ticker']
             series = historical_data.get(ticker)
-            
+
             stats = calculate_statistics(series, item)
-            
+
+            # Determine actual data source status
+            if item['source'] == 'SIMULATED' and ticker not in [
+                "FEDFUNDS_REAL", "AU_M2", "SI_BETA", "MA_BULL", "RSI_DIV", "BB_EXP"
+            ]:
+                source_label = f"{ticker} (Simulated)"
+            elif series is not None and len(series) >= 10:
+                source_label = f"{ticker} ({item['source']})"
+            else:
+                source_label = f"{ticker} (No Data)"
+
             entry = {
                 "Category": category,
                 "Indicator": item['ind'],
-                "Ticker / Source": f"{ticker} ({item['source']})",
+                "Ticker / Source": source_label,
                 "Value": stats["Value"],
                 "Colour Indicator": stats["Colour Indicator"],
                 "Total Factor Score": stats["Total Factor Score"],
@@ -242,13 +384,21 @@ decisive_signals = len(final_df[final_df['Colour Indicator'].isin(['Green', 'Red
 confidence_pct = (decisive_signals / total_factors) * 100 if total_factors > 0 else 0
 overall_bias = "Bullish" if overall_score > 10 else ("Bearish" if overall_score < -10 else "Neutral")
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("Overall System Bias", overall_bias)
 col2.metric("Aggregate Score (Dynamic)", f"{overall_score:.1f}")
 col3.metric("Level of Confidence", f"{confidence_pct:.1f}%")
+col4.metric("Live / Simulated Factors", f"{total_factors - simulated_count} / {simulated_count}")
 
-st.progress(confidence_pct / 100)
+# Clamp progress to [0.0, 1.0]
+st.progress(min(max(confidence_pct / 100.0, 0.0), 1.0))
 st.divider()
+
+# Show fetch errors in an expander if any
+if fetch_errors:
+    with st.expander(f"⚠️ Data Fetch Issues ({len(fetch_errors)})", expanded=False):
+        for err in fetch_errors:
+            st.text(f"  • {err}")
 
 def style_colour_indicator(val):
     colors = {'Green': '#00FF00', 'Red': '#FF0000', 'Yellow': '#FFD700'}
@@ -256,12 +406,12 @@ def style_colour_indicator(val):
 
 for cat in final_df['Category'].unique():
     cat_df = final_df[final_df['Category'] == cat]
-    
+
     subset_score = cat_df['Total Factor Score'].sum()
     c_color = "🟢" if subset_score > 0 else ("🔴" if subset_score < 0 else "🟡")
-    
+
     st.subheader(f"{cat}  {c_color} (Subset Score: {subset_score:.1f})")
-    
+
     display_df = cat_df.drop(columns=['Category'])
     st.dataframe(
         display_df.style.map(style_colour_indicator, subset=['Colour Indicator']),
