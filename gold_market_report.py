@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MI Metals Factors - Full 47-Factor Dynamic Engine
+Market Intelligence: Gold - Full 47-Factor Dynamic Engine
 Calculates 5Y Means, Z-Scores, and Percentiles dynamically from historical API data.
 """
 
@@ -25,7 +25,7 @@ ssl._create_default_https_context = ssl._create_unverified_context
 FRED_API_KEY = "412665086b998f7954423844843240b6"
 fred = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
 
-st.set_page_config(page_title="MI Metals Factors", layout="wide")
+st.set_page_config(page_title="Market Intelligence: Gold", layout="wide")
 
 # ─── Factor Configuration (All 47 Factors + Sub-factors) ─────────────────────
 # Each factor has:
@@ -977,7 +977,7 @@ def fetch_market_headlines():
 
 # ─── Dashboard Execution ─────────────────────────────────────────────────────
 
-st.title("📊 MI Metals Factors")
+st.title("📊 Market Intelligence: Gold")
 st.markdown(f"**Report Timestamp:** {datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')}")
 
 with st.spinner("Downloading 5 years of API market history & computing live Z-Scores for all 47 factors..."):
@@ -1251,21 +1251,25 @@ if gc_series is not None and len(rolling_scores) > 3:
 
     fig.update_layout(
         template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="#0f0f23",
         plot_bgcolor="#0e0e1a",
+        font=dict(color="#d0d0d0"),
         height=480,
         margin=dict(l=55, r=55, t=30, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="center", x=0.5, font=dict(size=11)),
         hovermode="closest",
     )
-    fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", showgrid=True)
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", showgrid=True,
+                     tickfont=dict(color="#aaa"))
     fig.update_yaxes(title_text="Gold $/oz", gridcolor="rgba(255,255,255,0.05)",
                      showgrid=True, secondary_y=False, tickformat="$,.0f",
-                     title_font=dict(color="#FFD700", size=11))
+                     title_font=dict(color="#FFD700", size=11),
+                     tickfont=dict(color="#ccc"))
     fig.update_yaxes(title_text="Score", secondary_y=True, range=[-1.05, 1.05],
                      tickformat="+.2f", title_font=dict(color="#60a5fa", size=11),
-                     gridcolor="rgba(255,255,255,0.03)")
+                     gridcolor="rgba(255,255,255,0.03)",
+                     tickfont=dict(color="#ccc"))
 
     chart_div_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False,
                                   div_id="goldChart", config={"displayModeBar": False})
@@ -1284,7 +1288,7 @@ if gc_series is not None and len(rolling_scores) > 3:
 <head>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: transparent; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  html, body { background: #0f0f23; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 
   .layout {
     display: flex;
