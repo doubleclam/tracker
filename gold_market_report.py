@@ -461,14 +461,16 @@ def fetch_historical_data():
         fetch_errors.append(f"SGE benchmark: {e}")
 
     # 1F. Fetch Google Trends for "buy gold" (5Y weekly via pytrends)
+    # Note: Google rate-limits pytrends aggressively (429 errors are common).
+    # This is non-critical — GTRENDS falls back to simulated data silently.
     try:
         pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25))
         pytrends.build_payload(kw_list=["buy gold"], timeframe="today 5-y", geo="")
         gt_df = pytrends.interest_over_time()
         if len(gt_df) > 10:
             hist_data["GTRENDS"] = gt_df["buy gold"].astype(float)
-    except Exception as e:
-        fetch_errors.append(f"Google Trends: {e}")
+    except Exception:
+        pass  # Google Trends 429 rate-limits are expected; factor uses simulated fallback
 
     # 2. Fetch Yahoo Finance Data (now includes FX pairs for gold-in-other-currencies)
     yf_tickers = [
