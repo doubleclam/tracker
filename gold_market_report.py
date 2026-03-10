@@ -5,12 +5,20 @@ Calculates 5Y Means, Z-Scores, and Percentiles dynamically from historical API d
 """
 
 import ssl
+import re
+import json
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 from fredapi import Fred
+from pytrends.request import TrendReq
 import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from collections import OrderedDict
+import xml.etree.ElementTree as ET
 
 # ─── Security & API Setup ────────────────────────────────────────────────────
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -76,41 +84,41 @@ FACTOR_CONFIG = {
          "unit": "%"}
     ],
     "II. Market Structure & Positioning": [
-        {"ind": "7. Managed Money Position", "ticker": "COT_MM", "source": "SIMULATED", "weight": 4, "higher_is_bullish": False, "why": "Crowded longs risk sharp liquidations.",
+        {"ind": "7. Managed Money Position", "ticker": "COT_MM", "source": "CFTC", "weight": 4, "higher_is_bullish": False, "why": "Crowded longs risk sharp liquidations.",
          "definition": "Net long/short position of Managed Money traders (hedge funds, CTAs) in COMEX gold futures, from the CFTC Commitments of Traders report. Extreme net long positioning (Z-score > 2.0) signals a crowded trade vulnerable to sharp liquidation. Extreme short positioning signals contrarian bullish potential.",
          "unit": "contracts"},
-        {"ind": "8. Swap Dealer Position", "ticker": "COT_SD", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Commercial positioning is the 'smart money'.",
+        {"ind": "8. Swap Dealer Position", "ticker": "COT_SD", "source": "CFTC", "weight": 3, "higher_is_bullish": True, "why": "Commercial positioning is the 'smart money'.",
          "definition": "Net position of Swap Dealers (major banks facilitating OTC gold transactions) in COMEX gold futures. These entities are considered 'smart money' because they have superior information about physical flows. When swap dealers reduce their typical net short, it signals reduced hedging demand or outright bullishness.",
          "unit": "contracts"},
-        {"ind": "9. Open Interest", "ticker": "COMEX_OI", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Reflects total speculative participation.",
+        {"ind": "9. Open Interest", "ticker": "COMEX_OI", "source": "CFTC", "weight": 2, "higher_is_bullish": True, "why": "Reflects total speculative participation.",
          "definition": "Total number of outstanding (unsettled) gold futures contracts on COMEX. Rising OI with rising prices confirms new money entering bullish bets. Rising OI with falling prices signals aggressive new shorts. Falling OI indicates position liquidation regardless of price direction.",
          "unit": "contracts"},
-        {"ind": "10. Futures Structure", "ticker": "FUT_CURVE", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Backwardation indicates tight physical supply.",
-         "definition": "The shape of the gold futures term structure. Contango (normal): deferred months trade above spot, reflecting storage/financing costs. Backwardation (rare): spot trades above deferred months, signaling extreme physical demand or delivery stress. Backwardation in gold is an exceptionally bullish signal.",
+        {"ind": "10. Futures Structure", "ticker": "FUT_CURVE", "source": "YF_CALC", "weight": 2, "higher_is_bullish": True, "why": "Backwardation indicates tight physical supply.",
+         "definition": "The shape of the gold futures term structure, measured as the spread between front-month COMEX gold futures (GC=F) and a spot proxy (GLD ETF x conversion factor). Positive = contango (normal), negative = backwardation (rare, bullish). Backwardation signals extreme physical demand or delivery stress.",
          "unit": "$/oz"},
         {"ind": "11. Options Skew", "ticker": "OPT_SKEW", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "Heavy call skew implies topside exhaustion.",
          "definition": "The 25-Delta Risk Reversal: the implied volatility of 25-delta calls minus 25-delta puts on gold options. Positive values (call premium) mean the market is paying more for upside protection, suggesting bullish consensus is already priced in. Negative values (put premium) suggest fear and hedging activity.",
          "unit": "vol pts"}
     ],
     "III. Physical Fundamentals & Flow": [
-        {"ind": "12. Shanghai Premium", "ticker": "SGE_PREM", "source": "SIMULATED", "weight": 4, "higher_is_bullish": True, "why": "Indicates physical demand strength in Asia.",
-         "definition": "The premium (or discount) of gold on the Shanghai Gold Exchange (SGE AU9999) versus the international LBMA benchmark, in $/oz. A positive premium means Chinese buyers are paying above global prices to secure physical gold, indicating strong demand. Premiums above $30/oz are historically significant.",
+        {"ind": "12. Shanghai Premium", "ticker": "SGE_PREM", "source": "SGE_API", "weight": 4, "higher_is_bullish": True, "why": "Indicates physical demand strength in Asia.",
+         "definition": "The premium (or discount) of gold on the Shanghai Gold Exchange versus COMEX, in $/oz. Calculated from the SGE daily benchmark price (CNY/gram) converted to USD/oz via the CNY/USD exchange rate, minus the COMEX front-month futures price. Positive premiums signal strong Chinese physical demand.",
          "unit": "$/oz"},
-        {"ind": "12A. Gold in Other Currencies", "ticker": "XAU_BASKET", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Broad cross-currency strength.",
-         "definition": "Gold's performance measured against a basket of non-USD currencies (EUR, JPY, GBP, CNY, INR). When gold makes new highs in most currencies simultaneously, it signals a genuine global repricing rather than just a USD weakness story. Broad-based strength is more sustainable.",
+        {"ind": "12A. Gold in Other Currencies", "ticker": "XAU_BASKET", "source": "YF_CALC", "weight": 3, "higher_is_bullish": True, "why": "Broad cross-currency strength.",
+         "definition": "Gold's performance measured against a basket of non-USD currencies (EUR, GBP, JPY, CNY). Calculated as the equal-weighted average of gold priced in each currency via YF FX rates. When gold makes new highs in most currencies simultaneously, it signals genuine global repricing rather than just USD weakness.",
          "unit": "index"},
         {"ind": "13. Indian Demand Premium", "ticker": "IN_PREM", "source": "SIMULATED", "weight": 4, "higher_is_bullish": True, "why": "Core cultural and seasonal demand indicator.",
          "definition": "The premium or discount at which gold trades in India versus international benchmarks. India is the world's second-largest gold consumer. Premiums indicate strong local demand (often seasonal around Diwali and wedding season). Discounts signal weak demand or import restrictions.",
          "unit": "$/oz"},
-        {"ind": "13A. India Wedding Season", "ticker": "IN_WEDDING", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
-         "definition": "A seasonal indicator tracking India's wedding season intensity. Indian weddings drive enormous gold jewelry demand, particularly during auspicious dates (Oct-Dec, Jan-Feb). Peak wedding season can add 100-200 tonnes of incremental annual demand.",
-         "unit": "index"},
-        {"ind": "13B. China Lunar New Year", "ticker": "CN_LNY", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
-         "definition": "A seasonal indicator for Chinese gold demand around Lunar New Year (Jan-Feb). Gold gifting is a deeply embedded cultural tradition. Demand typically surges 4-6 weeks before the holiday, creating seasonal price support.",
-         "unit": "index"},
-        {"ind": "14. ETF Flows", "ticker": "ETF_FLOWS", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Institutional and retail accumulation.",
-         "definition": "Net inflows or outflows from physically-backed gold ETFs (GLD, IAU, etc.), measured in tonnes. ETF flows represent Western institutional and retail investment demand. Large sustained inflows signal a shift in portfolio allocation toward gold. The World Gold Council reports these weekly.",
-         "unit": "tonnes"},
+        {"ind": "13A. India Wedding Season", "ticker": "IN_WEDDING", "source": "CALENDAR", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
+         "definition": "A seasonal indicator tracking India's wedding season intensity. Score 100 = peak season (Oct-Feb, especially Diwali and post-harvest weddings), 50 = shoulder (Mar, Sep), 25 = off-season (Apr-Aug). Indian weddings drive enormous gold jewelry demand, adding 100-200 tonnes of incremental annual demand during peak months.",
+         "unit": "0-100"},
+        {"ind": "13B. China Lunar New Year", "ticker": "CN_LNY", "source": "CALENDAR", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
+         "definition": "A seasonal indicator for Chinese gold demand. Score 100 = peak gifting/buying season (Jan-Feb around Lunar New Year and Golden Week in Oct), 50 = shoulder months, 25 = off-season. Gold gifting is a deeply embedded cultural tradition; demand typically surges 4-6 weeks before the holiday.",
+         "unit": "0-100"},
+        {"ind": "14. ETF Flows (GLD Volume)", "ticker": "ETF_FLOWS", "source": "YF_CALC", "weight": 3, "higher_is_bullish": True, "why": "Institutional and retail accumulation.",
+         "definition": "20-day average daily dollar volume of the SPDR Gold Trust (GLD), the largest physically-backed gold ETF. Rising volume indicates increasing institutional and retail interest in gold exposure. Used as a proxy for ETF flow momentum since actual tonnage flow data requires paid subscriptions.",
+         "unit": "$B"},
         {"ind": "14A. US Mint Coin Sales", "ticker": "US_MINT", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Retail physical demand proxy.",
          "definition": "Monthly sales of American Gold Eagle and American Gold Buffalo coins by the US Mint. A direct measure of retail/individual investor demand for physical gold. Spikes in coin sales (like March 2020) often coincide with financial stress or loss of confidence in the monetary system.",
          "unit": "oz"},
@@ -148,8 +156,8 @@ FACTOR_CONFIG = {
         {"ind": "22. TED Spread", "ticker": "TEDRATE", "source": "FRED", "weight": 2, "higher_is_bullish": False, "why": "Measures perceived credit risk in banking.",
          "definition": "The spread between 3-Month LIBOR (interbank lending rate) and the 3-Month Treasury bill yield. Widening TED spread signals that banks are charging each other more to lend, reflecting rising counterparty risk fears. Spikes (like 2008's 4.5%) trigger safe-haven flows into gold. Note: LIBOR was discontinued in 2023; SOFR-based spreads are the modern equivalent.",
          "unit": "%"},
-        {"ind": "23. SOFR-OIS Spread", "ticker": "SOFR_OIS", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Interbank liquidity stress.",
-         "definition": "The spread between the Secured Overnight Financing Rate (SOFR) and the Overnight Indexed Swap (OIS) rate. The modern replacement for the TED Spread after LIBOR's discontinuation. Widening signals stress in short-term funding markets, which can cascade into broader financial instability and gold buying.",
+        {"ind": "23. SOFR-OIS Spread", "ticker": "SOFR_OIS", "source": "FRED_CALC", "weight": 2, "higher_is_bullish": False, "why": "Interbank liquidity stress.",
+         "definition": "The spread between SOFR (Secured Overnight Financing Rate) and the effective Federal Funds Rate (OIS proxy), in basis points. Both from FRED. The modern replacement for the TED Spread after LIBOR's discontinuation. Widening signals stress in short-term secured funding markets.",
          "unit": "bps"},
         {"ind": "24. Fed Reverse Repo Usage", "ticker": "RRPONTSYD", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Drains excess liquidity from the system.",
          "definition": "The total dollar amount parked overnight at the Federal Reserve's Reverse Repo Facility (RRP). Money market funds and banks use the RRP to earn a risk-free return. High RRP usage (>$2T in 2022-2023) means excess liquidity is being drained from the financial system. As the RRP drains toward zero, that liquidity re-enters markets.",
@@ -197,16 +205,16 @@ FACTOR_CONFIG = {
         {"ind": "34. RSI Divergence", "ticker": "RSI_DIV", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Momentum exhaustion indicator.",
          "definition": "The 14-day Relative Strength Index for gold. RSI oscillates 0-100, measuring the speed and magnitude of recent price changes. Above 70 = overbought (potential pullback risk). Below 30 = oversold (potential bounce). Most useful when RSI diverges from price: price makes new highs but RSI doesn't, signaling weakening momentum.",
          "unit": "0-100"},
-        {"ind": "35. Volume Profile", "ticker": "VOL_PROF", "source": "SIMULATED", "weight": 1, "higher_is_bullish": True, "why": "Support level consolidation.",
-         "definition": "A measure of trading volume at each price level, identifying the Volume Point of Control (VPOC) — the price with the most volume. Breakouts above areas of thin volume (low-volume nodes) tend to be explosive. Price consolidation around high-volume nodes creates strong support/resistance. Thin liquidity above current price is bullish.",
-         "unit": "index"}
+        {"ind": "35. Volume Profile", "ticker": "VOL_PROF", "source": "YF_CALC", "weight": 1, "higher_is_bullish": True, "why": "Support level consolidation.",
+         "definition": "The 20-day average daily trading volume of GC=F gold futures, normalized as a ratio to the 5Y average volume. Values above 1.0 indicate above-average participation. Rising volume during price advances confirms trend strength and institutional conviction. Falling volume during rallies warns of weak hands.",
+         "unit": "ratio"}
     ],
     "VIII. Black Swan & Exogenous Risks": [
         {"ind": "36. Equity and Gold Volatility", "ticker": "^VIX", "source": "YF", "weight": 2, "higher_is_bullish": True, "why": "Spikes trigger safe-haven capital flight.",
          "definition": "The CBOE Volatility Index (VIX), derived from S&P 500 option prices. Represents the market's expectation of 30-day annualized equity volatility. Known as the 'fear gauge.' VIX spikes above 30 signal acute market stress and typically trigger safe-haven flows into gold. Sustained elevated VIX (>25) supports gold's risk premium.",
          "unit": "vol pts"},
-        {"ind": "37. Geopolitical Risk", "ticker": "GPR_IDX", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Reflects safe-haven tail risk premiums.",
-         "definition": "The Caldara-Iacoviello Geopolitical Risk Index, constructed by counting newspaper articles related to geopolitical tensions, wars, and terrorism. Higher readings indicate elevated global tensions. Gold has historically rallied 5-15% during acute geopolitical crises (wars, terrorist attacks, sanctions escalations) due to its safe-haven status.",
+        {"ind": "37. Geopolitical Risk", "ticker": "GPR_IDX", "source": "WEB_CSV", "weight": 3, "higher_is_bullish": True, "why": "Reflects safe-haven tail risk premiums.",
+         "definition": "The Caldara-Iacoviello Geopolitical Risk Index, constructed by counting newspaper articles related to geopolitical tensions, wars, and terrorism. Baseline 100 = 1985-2019 average. Published monthly by Matteo Iacoviello (Federal Reserve Board). Gold has historically rallied 5-15% during acute geopolitical crises.",
          "unit": "index"},
         {"ind": "38. US CDS", "ticker": "US_CDS", "source": "SIMULATED", "weight": 1, "higher_is_bullish": True, "why": "Sovereign default risk proxies.",
          "definition": "The cost of credit default swap (CDS) protection on US sovereign debt, in basis points. CDS pricing reflects the market's perceived probability of a US government default. Spikes (like during the 2023 debt ceiling crisis) signal sovereign risk concerns that directly benefit gold as the ultimate 'money of last resort.'",
@@ -231,8 +239,8 @@ FACTOR_CONFIG = {
          "unit": "x"}
     ],
     "IX. Sentiment & Retail Indicators": [
-        {"ind": "45. Google Trends - Buy Gold", "ticker": "GTRENDS", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Retail euphoria often marks local tops.",
-         "definition": "Google search interest for terms like 'buy gold,' 'gold price,' and 'gold investment,' indexed 0-100. Extreme spikes in search interest often coincide with retail FOMO buying near local price tops. Conversely, low search interest during rising prices suggests the move is under-owned and has further to run. A contrarian indicator.",
+        {"ind": "45. Google Trends - Buy Gold", "ticker": "GTRENDS", "source": "PYTRENDS", "weight": 2, "higher_is_bullish": False, "why": "Retail euphoria often marks local tops.",
+         "definition": "Google search interest for 'buy gold' over the past 5 years, indexed 0-100 (weekly data via pytrends). Extreme spikes in search interest often coincide with retail FOMO buying near local price tops. Conversely, low search interest during rising prices suggests the move is under-owned and has further to run. A contrarian indicator.",
          "unit": "0-100"},
         {"ind": "46. Gold Advertising Spending", "ticker": "AD_SPEND", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "Late-cycle retail trapping indicator.",
          "definition": "Estimated aggregate spending on gold-related advertising (TV, online, radio) by dealers, mints, and bullion companies. Heavy advertising spend typically targets retail investors during euphoric price runs, extracting high premiums from late buyers. Peak ad spend often correlates with local price tops — a classic contrarian sell signal.",
@@ -245,6 +253,92 @@ FACTOR_CONFIG = {
 
 # ─── Dynamic Historical Data Engine ──────────────────────────────────────────
 
+def fetch_cftc_cot_data(start_date, end_date):
+    """
+    Fetch CFTC Commitments of Traders (Disaggregated) data for Gold futures.
+    Returns dict with COT_MM (Managed Money net position), COT_SD (Swap Dealer net position),
+    and COMEX_OI (Open Interest) as pandas Series.
+
+    Uses the CFTC public Socrata API:
+    https://publicreporting.cftc.gov/resource/72hh-3qpy.json (Disaggregated Futures-Only)
+    Gold contract code = 088691
+    """
+    results = {}
+    errors = []
+
+    # CFTC API: Disaggregated Futures-Only report
+    base_url = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+
+    # Format dates for Socrata API query
+    start_str = start_date.strftime("%Y-%m-%dT00:00:00.000")
+    end_str = end_date.strftime("%Y-%m-%dT23:59:59.000")
+
+    # Fetch all weekly reports for Gold (088691) in the 5Y window
+    # Socrata has a 1000-row default limit; 5 years ≈ 260 weeks, so 1000 is sufficient
+    params = {
+        "$where": f"cftc_contract_market_code='088691' AND report_date_as_yyyy_mm_dd >= '{start_str}' AND report_date_as_yyyy_mm_dd <= '{end_str}'",
+        "$order": "report_date_as_yyyy_mm_dd ASC",
+        "$limit": 1000
+    }
+
+    try:
+        resp = requests.get(base_url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data:
+            errors.append("CFTC COT: API returned empty data for Gold (088691)")
+            return results, errors
+
+        dates = []
+        mm_net = []       # Managed Money net (long - short)
+        sd_net = []       # Swap Dealer net (long - short)
+        oi_vals = []      # Open Interest
+
+        for record in data:
+            try:
+                # Parse the date
+                date_str = record.get("report_date_as_yyyy_mm_dd", "")
+                if not date_str:
+                    continue
+                dt = pd.Timestamp(date_str[:10])
+
+                # Managed Money: long - short = net position
+                mm_long = float(record.get("m_money_positions_long_all", 0))
+                mm_short = float(record.get("m_money_positions_short_all", 0))
+
+                # Swap Dealers: long - short = net position
+                # Note: CFTC API has double underscore in swap short field name
+                sd_long = float(record.get("swap_positions_long_all", 0))
+                sd_short = float(record.get("swap__positions_short_all", record.get("swap_positions_short_all", 0)))
+
+                # Open Interest
+                oi = float(record.get("open_interest_all", 0))
+
+                dates.append(dt)
+                mm_net.append(mm_long - mm_short)
+                sd_net.append(sd_long - sd_short)
+                oi_vals.append(oi)
+
+            except (ValueError, TypeError) as e:
+                continue  # skip malformed records
+
+        if dates:
+            idx = pd.DatetimeIndex(dates)
+            results["COT_MM"] = pd.Series(mm_net, index=idx, name="COT_MM")
+            results["COT_SD"] = pd.Series(sd_net, index=idx, name="COT_SD")
+            results["COMEX_OI"] = pd.Series(oi_vals, index=idx, name="COMEX_OI")
+        else:
+            errors.append("CFTC COT: parsed 0 valid records from API response")
+
+    except requests.exceptions.RequestException as e:
+        errors.append(f"CFTC COT API request failed: {e}")
+    except Exception as e:
+        errors.append(f"CFTC COT processing error: {e}")
+
+    return results, errors
+
+
 @st.cache_data(ttl=3600)
 def fetch_historical_data():
     """Fetches 5 years of daily/monthly history to calculate true Z-Scores for all 47 factors"""
@@ -253,6 +347,11 @@ def fetch_historical_data():
 
     hist_data = {}
     fetch_errors = []
+
+    # 0. Fetch CFTC COT Data (Managed Money, Swap Dealers, Open Interest)
+    cot_data, cot_errors = fetch_cftc_cot_data(start_date, end_date)
+    hist_data.update(cot_data)
+    fetch_errors.extend(cot_errors)
 
     # 1. Fetch FRED Data
     if fred:
@@ -300,11 +399,83 @@ def fetch_historical_data():
         if "FYFSGDA188S" in hist_data:
             hist_data["FYFSGDA188S"] = -hist_data["FYFSGDA188S"]
 
-    # 2. Fetch Yahoo Finance Data
+    # 1B. Fetch SOFR and DFF (Fed Funds Daily) from FRED for SOFR-OIS spread
+    if fred:
+        try:
+            sofr = fred.get_series("SOFR", observation_start=start_date).dropna()
+            dff = fred.get_series("DFF", observation_start=start_date).dropna()
+            if len(sofr) > 10 and len(dff) > 10:
+                aligned_rates = pd.concat([sofr, dff], axis=1).dropna()
+                aligned_rates.columns = ["SOFR", "DFF"]
+                # Spread in basis points
+                sofr_ois = (aligned_rates["SOFR"] - aligned_rates["DFF"]) * 100
+                if len(sofr_ois) > 10:
+                    hist_data["SOFR_OIS"] = sofr_ois
+        except Exception as e:
+            fetch_errors.append(f"SOFR-OIS calc: {e}")
+
+    # 1C. Fetch Geopolitical Risk Index (Caldara-Iacoviello)
+    try:
+        gpr_url = "https://www.matteoiacoviello.com/gpr_files/data_gpr_export.xls"
+        gpr_df = pd.read_excel(gpr_url, engine="xlrd")
+        gpr_series = gpr_df.set_index("month")["GPR"].dropna()
+        gpr_series.index = pd.DatetimeIndex(gpr_series.index)
+        # Filter to our 5Y window
+        gpr_series = gpr_series[gpr_series.index >= start_date]
+        if len(gpr_series) > 10:
+            hist_data["GPR_IDX"] = gpr_series
+    except Exception as e:
+        fetch_errors.append(f"GPR Index: {e}")
+
+    # 1D. Build seasonal calendar indicators (India Wedding + China Lunar New Year)
+    cal_dates = pd.date_range(start=start_date, end=end_date, freq="B")
+
+    # India Wedding Season: peak Oct-Feb (100), shoulder Mar/Sep (50), off-season Apr-Aug (25)
+    india_scores = {1: 100, 2: 100, 3: 50, 4: 25, 5: 25, 6: 25,
+                    7: 25, 8: 25, 9: 50, 10: 100, 11: 100, 12: 100}
+    hist_data["IN_WEDDING"] = pd.Series(
+        [india_scores[d.month] for d in cal_dates], index=cal_dates)
+
+    # China Lunar New Year: peak Jan-Feb (100), Oct Golden Week (75), shoulder (50), off (25)
+    china_scores = {1: 100, 2: 100, 3: 50, 4: 25, 5: 25, 6: 25,
+                    7: 25, 8: 25, 9: 50, 10: 75, 11: 50, 12: 75}
+    hist_data["CN_LNY"] = pd.Series(
+        [china_scores[d.month] for d in cal_dates], index=cal_dates)
+
+    # 1E. Fetch Shanghai Gold Exchange premium (SGE benchmark - COMEX, in USD/oz)
+    # SGE publishes daily benchmark prices in CNY/gram via a JSON endpoint.
+    # We convert to USD/oz using the CNY=X FX rate and subtract COMEX gold futures.
+    try:
+        sge_url = "https://en.sge.com.cn/graph/DayilyJzj"
+        sge_resp = requests.get(sge_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        sge_json = sge_resp.json()
+        if "zp" in sge_json and len(sge_json["zp"]) > 0:
+            sge_dates = [pd.Timestamp(p[0], unit="ms") for p in sge_json["zp"]]
+            sge_prices = [float(p[1]) for p in sge_json["zp"]]
+            sge_cny_g = pd.Series(sge_prices, index=sge_dates, name="SGE_CNY_g")
+            # Filter to 5Y window
+            sge_cny_g = sge_cny_g[sge_cny_g.index >= start_date]
+            if len(sge_cny_g) > 10:
+                hist_data["_SGE_CNY_G"] = sge_cny_g  # store for premium calc after YF data
+    except Exception as e:
+        fetch_errors.append(f"SGE benchmark: {e}")
+
+    # 1F. Fetch Google Trends for "buy gold" (5Y weekly via pytrends)
+    try:
+        pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25))
+        pytrends.build_payload(kw_list=["buy gold"], timeframe="today 5-y", geo="")
+        gt_df = pytrends.interest_over_time()
+        if len(gt_df) > 10:
+            hist_data["GTRENDS"] = gt_df["buy gold"].astype(float)
+    except Exception as e:
+        fetch_errors.append(f"Google Trends: {e}")
+
+    # 2. Fetch Yahoo Finance Data (now includes FX pairs for gold-in-other-currencies)
     yf_tickers = [
         "DX-Y.NYB", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
         "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ",
-        "PA=F", "HG=F"
+        "PA=F", "HG=F",
+        "EUR=X", "GBPUSD=X", "JPY=X", "CNY=X"
     ]
     try:
         yf_df = yf.download(yf_tickers, start=start_date, end=end_date, progress=False)
@@ -397,6 +568,107 @@ def fetch_historical_data():
             if len(bb_width) > 10:
                 hist_data["BB_EXP"] = bb_width
 
+        # Compute Futures Structure: GC=F (front-month futures) minus GLD*conversion as spot proxy
+        # GLD represents ~0.0925 oz per share; inverse ≈ 10.81 but drifts with expense ratio
+        # We use a dynamic ratio: GC=F / GLD gives the implied conversion factor
+        if "GC=F" in hist_data and "GLD" in hist_data:
+            gc = hist_data["GC=F"]
+            gld = hist_data["GLD"]
+            # Compute basis spread: positive = contango, negative = backwardation
+            # Use GC=F - GLD * (GC=F.iloc[0] / GLD.iloc[0]) to anchor the conversion factor
+            conv_factor = gc.iloc[0] / gld.iloc[0] if gld.iloc[0] != 0 else 10.0
+            basis = (gc - gld * conv_factor).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(basis) > 10:
+                hist_data["FUT_CURVE"] = basis
+
+        # Compute Gold in Other Currencies basket (equal-weighted index)
+        # EUR=X gives USD per EUR, others give currency per USD
+        if "GC=F" in hist_data:
+            gc = hist_data["GC=F"]
+            fx_components = []
+
+            # Gold in EUR: GC=F * EUR=X (EUR=X = USD per 1 EUR, so gold_eur = GC=F / (1/EUR=X) = GC=F * EUR=X)
+            # Actually EUR=X on YF returns EUR per 1 USD. So gold_eur = GC=F * EUR=X
+            if "EUR=X" in hist_data:
+                fx_components.append(gc * hist_data["EUR=X"])
+            # Gold in GBP: GBPUSD=X = USD per 1 GBP, so gold_gbp = GC=F / GBPUSD=X
+            if "GBPUSD=X" in hist_data:
+                fx_components.append(gc / hist_data["GBPUSD=X"])
+            # Gold in JPY: JPY=X on YF = USD/JPY? Actually YF JPY=X returns JPY per 1 USD
+            # So gold_jpy = GC=F * JPY=X (but very large numbers, we'll normalize)
+            if "JPY=X" in hist_data:
+                fx_components.append(gc * hist_data["JPY=X"])
+            # Gold in CNY: CNY=X = CNY per 1 USD, so gold_cny = GC=F * CNY=X
+            if "CNY=X" in hist_data:
+                fx_components.append(gc * hist_data["CNY=X"])
+
+            if len(fx_components) >= 2:
+                # Normalize each to base=100 at start, then average
+                normalized = []
+                for comp in fx_components:
+                    comp = comp.dropna()
+                    if len(comp) > 10:
+                        normalized.append(comp / comp.iloc[0] * 100)
+                if normalized:
+                    basket = pd.concat(normalized, axis=1).dropna().mean(axis=1)
+                    if len(basket) > 10:
+                        hist_data["XAU_BASKET"] = basket
+
+        # Compute Shanghai Premium: SGE (CNY/g -> USD/oz) minus COMEX
+        if "_SGE_CNY_G" in hist_data and "GC=F" in hist_data and "CNY=X" in hist_data:
+            try:
+                sge_cny = hist_data["_SGE_CNY_G"].resample("D").ffill()
+                cny_rate = hist_data["CNY=X"].resample("D").ffill()
+                gc_daily = hist_data["GC=F"].resample("D").ffill()
+                sge_aligned = pd.concat([sge_cny, cny_rate, gc_daily], axis=1).dropna()
+                sge_aligned.columns = ["sge_cny_g", "cny_per_usd", "comex"]
+                # Convert SGE CNY/gram to USD/oz: price * 31.1035 / cny_rate
+                sge_aligned["sge_usd_oz"] = sge_aligned["sge_cny_g"] * 31.1035 / sge_aligned["cny_per_usd"]
+                sge_premium = sge_aligned["sge_usd_oz"] - sge_aligned["comex"]
+                sge_premium = sge_premium.dropna()
+                if len(sge_premium) > 10:
+                    hist_data["SGE_PREM"] = sge_premium
+            except Exception as e:
+                fetch_errors.append(f"SGE premium calc: {e}")
+
+        # Compute ETF Flows proxy: 20-day average dollar volume of GLD (in billions)
+        if "GLD" in hist_data:
+            try:
+                gld_full = yf_df
+                if isinstance(gld_full.columns, pd.MultiIndex):
+                    gld_vol = gld_full[("Volume", "GLD")].dropna()
+                    gld_close = gld_full[("Close", "GLD")].dropna()
+                else:
+                    gld_vol = gld_full["Volume"].dropna() if "Volume" in gld_full.columns else None
+                    gld_close = gld_full["Close"].dropna() if "Close" in gld_full.columns else None
+
+                if gld_vol is not None and gld_close is not None:
+                    aligned_gld = pd.concat([gld_close, gld_vol], axis=1).dropna()
+                    aligned_gld.columns = ["close", "vol"]
+                    dollar_vol = (aligned_gld["close"] * aligned_gld["vol"]) / 1e9  # in $B
+                    etf_flow = dollar_vol.rolling(20).mean().dropna()
+                    if len(etf_flow) > 10:
+                        hist_data["ETF_FLOWS"] = etf_flow
+            except Exception as e:
+                fetch_errors.append(f"ETF_FLOWS calc: {e}")
+
+        # Compute Volume Profile: 20-day avg volume / 5Y avg volume ratio for GC=F
+        try:
+            if isinstance(yf_df.columns, pd.MultiIndex):
+                gc_vol = yf_df[("Volume", "GC=F")].dropna()
+            else:
+                gc_vol = None
+
+            if gc_vol is not None and len(gc_vol) > 200:
+                avg_5y = gc_vol.mean()
+                if avg_5y > 0:
+                    vol_ratio = gc_vol.rolling(20).mean() / avg_5y
+                    vol_ratio = vol_ratio.dropna()
+                    if len(vol_ratio) > 10:
+                        hist_data["VOL_PROF"] = vol_ratio
+        except Exception as e:
+            fetch_errors.append(f"VOL_PROF calc: {e}")
+
     except Exception as e:
         fetch_errors.append(f"YF bulk download: {e}")
 
@@ -468,6 +740,67 @@ def format_value_with_unit(val, unit):
         return f"{val:.2f} {unit}"
 
 
+def make_sparkline_svg(series, n_days=50, width=120, height=28):
+    """
+    Generate an inline SVG sparkline from the last n_days of a pandas Series.
+    Returns an HTML string containing the SVG element.
+
+    The line is colored:
+      - green if the last value > first value (uptrend over the window)
+      - red   if the last value < first value (downtrend)
+      - gray  if flat / insufficient data
+
+    A small dot marks the current (rightmost) value.
+    """
+    if series is None or len(series) < 3:
+        return f'<svg width="{width}" height="{height}"></svg>'
+
+    # Take the last n_days data points
+    tail = series.dropna().tail(n_days)
+    if len(tail) < 3:
+        return f'<svg width="{width}" height="{height}"></svg>'
+
+    values = tail.values.astype(float)
+    n = len(values)
+
+    # Determine color from trend direction
+    if values[-1] > values[0] * 1.001:
+        stroke = "#22c55e"  # green = up
+    elif values[-1] < values[0] * 0.999:
+        stroke = "#ef4444"  # red = down
+    else:
+        stroke = "#888"     # gray = flat
+
+    # Normalize values to SVG coordinate space
+    v_min = values.min()
+    v_max = values.max()
+    v_range = v_max - v_min
+    if v_range == 0:
+        v_range = 1.0  # avoid div-by-zero for constant series
+
+    pad_y = 3  # vertical padding in px
+    usable_h = height - 2 * pad_y
+
+    points = []
+    for i, v in enumerate(values):
+        x = (i / (n - 1)) * width
+        y = pad_y + usable_h - ((v - v_min) / v_range) * usable_h
+        points.append(f"{x:.1f},{y:.1f}")
+
+    polyline = " ".join(points)
+    last_x = width
+    last_y = pad_y + usable_h - ((values[-1] - v_min) / v_range) * usable_h
+
+    svg = (
+        f'<svg width="{width}" height="{height}" style="display:block;">'
+        f'<polyline points="{polyline}" fill="none" stroke="{stroke}" '
+        f'stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>'
+        f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="2" fill="{stroke}"/>'
+        f'</svg>'
+    )
+    return svg
+
+
 def calculate_statistics(series, config):
     """Dynamically calculates 5Y Mean, Std, Z-Score, and Confidence Scores"""
     unit = config.get("unit", "")
@@ -513,6 +846,133 @@ def calculate_statistics(series, config):
         "Colour Indicator": color
     }
 
+def compute_rolling_scores(historical_data, n_days=50):
+    """
+    Compute a daily Gold Score time series over the last n_days.
+    For each day t in the window, we treat each factor's value at day t as
+    'current' and compute its z-score against the full 5Y history up to day t.
+    Returns a pd.Series of normalized gold scores indexed by date.
+    """
+    end_date = datetime.now()
+    start_window = end_date - timedelta(days=n_days + 10)  # slight buffer
+
+    # Get the common date range from GC=F (most liquid series)
+    gc = historical_data.get("GC=F")
+    if gc is None or len(gc) < n_days:
+        return pd.Series(dtype=float)
+
+    date_range = gc.index[gc.index >= pd.Timestamp(start_window)]
+    if len(date_range) < 5:
+        return pd.Series(dtype=float)
+
+    # Sample every 2nd trading day to keep compute time reasonable (~45 points for 90 days)
+    sampled_dates = date_range[::2]
+    if len(sampled_dates) < 3:
+        sampled_dates = date_range
+
+    max_possible_score = sum(
+        item['weight'] * 3
+        for indicators in FACTOR_CONFIG.values()
+        for item in indicators
+    )
+
+    daily_scores = {}
+    for d in sampled_dates:
+        day_total = 0.0
+        for _cat, indicators in FACTOR_CONFIG.items():
+            for item in indicators:
+                ticker = item['ticker']
+                series = historical_data.get(ticker)
+                if series is None or len(series) < 10:
+                    continue
+                # Use data up to day d
+                s_up_to = series[series.index <= d]
+                if len(s_up_to) < 10:
+                    continue
+                current_val = float(s_up_to.iloc[-1])
+                mean_val = float(s_up_to.mean())
+                std_val = float(s_up_to.std())
+                if std_val == 0:
+                    continue
+                z = (current_val - mean_val) / std_val
+                weight = item['weight']
+                raw = z * weight if item['higher_is_bullish'] else -z * weight
+                factor_score = max(min(raw, weight * 3), -weight * 3)
+                day_total += factor_score
+        if max_possible_score > 0:
+            daily_scores[d] = max(min(day_total / max_possible_score, 1.0), -1.0)
+
+    if not daily_scores:
+        return pd.Series(dtype=float)
+    return pd.Series(daily_scores).sort_index()
+
+
+def fetch_market_headlines():
+    """
+    Fetch recent financial headlines relevant to gold/precious metals from
+    free news sources. Returns a list of dicts with 'date', 'title', 'source', 'url'.
+    Uses the EODHD / Finviz / or a simple RSS approach.
+    Falls back to identifying significant factor changes as 'headlines'.
+    """
+    headlines = []
+
+    # Approach 1: Try Google News RSS for gold-related headlines
+    try:
+        rss_url = "https://news.google.com/rss/search?q=gold+price+OR+federal+reserve+OR+inflation+OR+precious+metals&hl=en-US&gl=US&ceid=US:en"
+        resp = requests.get(rss_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.content)
+            items = root.findall('.//item')
+            for item in items[:30]:  # last 30 headlines
+                title_el = item.find('title')
+                pub_el = item.find('pubDate')
+                source_el = item.find('source')
+                link_el = item.find('link')
+                if title_el is not None and pub_el is not None:
+                    try:
+                        pub_date = pd.Timestamp(pub_el.text)
+                        # Strip timezone to avoid tz-naive vs tz-aware comparison errors
+                        if pub_date.tzinfo is not None:
+                            pub_date = pub_date.tz_localize(None)
+                        headlines.append({
+                            'date': pub_date.strftime('%Y-%m-%d'),
+                            'datetime': pub_date,
+                            'title': title_el.text or '',
+                            'source': source_el.text if source_el is not None else 'Google News',
+                            'url': link_el.text if link_el is not None else ''
+                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # Approach 2: Add FOMC meeting dates as structural headlines
+    fomc_dates_2024_2026 = [
+        "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
+        "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+        "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-17",
+        "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+        "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16"
+    ]
+    now = datetime.now()
+    for d_str in fomc_dates_2024_2026:
+        d = pd.Timestamp(d_str)
+        if (now - timedelta(days=90)) <= d <= (now + timedelta(days=30)):
+            label = "FOMC Rate Decision" if d <= pd.Timestamp(now) else "FOMC Meeting (Upcoming)"
+            headlines.append({
+                'date': d_str,
+                'datetime': d,
+                'title': label,
+                'source': 'Federal Reserve',
+                'url': 'https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm'
+            })
+
+    # Sort by date descending
+    headlines.sort(key=lambda x: x.get('datetime', pd.Timestamp('2000-01-01')), reverse=True)
+    return headlines
+
+
 # ─── Dashboard Execution ─────────────────────────────────────────────────────
 
 st.title("📊 MI Metals Factors")
@@ -535,14 +995,20 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
             stats = calculate_statistics(series, item)
 
             # Determine actual data source status
-            if item['source'] == 'SIMULATED' and ticker not in [
-                "FEDFUNDS_REAL", "AU_M2", "SI_BETA", "MA_BULL", "RSI_DIV", "BB_EXP"
-            ]:
+            is_computed_live = ticker in historical_data and not (
+                item['source'] == 'SIMULATED' and ticker not in [
+                    "FEDFUNDS_REAL", "AU_M2", "SI_BETA", "MA_BULL", "RSI_DIV", "BB_EXP"
+                ]
+            )
+            if item['source'] == 'SIMULATED' and not is_computed_live:
                 source_label = f"{ticker} (Simulated)"
             elif series is not None and len(series) >= 10:
                 source_label = f"{ticker} ({item['source']})"
             else:
                 source_label = f"{ticker} (No Data)"
+
+            # Generate 50-day sparkline SVG
+            sparkline_svg = make_sparkline_svg(series, n_days=50)
 
             entry = {
                 "Category": category,
@@ -550,6 +1016,7 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
                 "Definition": item.get('definition', ''),
                 "Ticker / Source": source_label,
                 "Value": stats["Value"],
+                "Sparkline": sparkline_svg,
                 "Colour Indicator": stats["Colour Indicator"],
                 "Total Factor Score": stats["Total Factor Score"],
                 "Z-Score": stats.get("Z-Score", "N/A"),
@@ -562,19 +1029,126 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
 
     final_df = pd.DataFrame(report_data)
 
+    # Compute rolling Gold Scores for sparkline and chart
+    rolling_scores = compute_rolling_scores(historical_data, n_days=90)
+
+    # Fetch market headlines
+    headlines = fetch_market_headlines()
+
 # ─── Overall Confidence & Scoring Calculations ───────────────────────────────
 
 overall_score = final_df['Total Factor Score'].sum()
 total_factors = len(final_df)
 decisive_signals = len(final_df[final_df['Colour Indicator'].isin(['Green', 'Red'])])
 confidence_pct = (decisive_signals / total_factors) * 100 if total_factors > 0 else 0
-overall_bias = "Bullish" if overall_score > 10 else ("Bearish" if overall_score < -10 else "Neutral")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Overall System Bias", overall_bias)
-col2.metric("Aggregate Score (Dynamic)", f"{overall_score:.1f}")
-col3.metric("Level of Confidence", f"{confidence_pct:.1f}%")
-col4.metric("Live / Simulated Factors", f"{total_factors - simulated_count} / {simulated_count}")
+# Compute maximum possible bullish score: sum of (weight * 3) for every factor
+max_possible_score = sum(
+    item['weight'] * 3
+    for indicators in FACTOR_CONFIG.values()
+    for item in indicators
+)
+
+# Normalized Gold Score: actual / max, bounded [-1.0, +1.0]
+gold_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
+gold_score = max(min(gold_score, 1.0), -1.0)
+
+# Interpretation scale
+if gold_score >= 0.5:
+    interpretation = "Strong Bullish"
+    interp_color = "#22c55e"
+    interp_emoji = "🟢🟢"
+elif gold_score >= 0.1:
+    interpretation = "Moderately Bullish"
+    interp_color = "#86efac"
+    interp_emoji = "🟢"
+elif gold_score > -0.1:
+    interpretation = "Neutral"
+    interp_color = "#facc15"
+    interp_emoji = "🟡"
+elif gold_score > -0.5:
+    interpretation = "Moderately Bearish"
+    interp_color = "#fca5a5"
+    interp_emoji = "🔴"
+else:
+    interpretation = "Strong Bearish"
+    interp_color = "#ef4444"
+    interp_emoji = "🔴🔴"
+
+# ─── Summary Score Panel ─────────────────────────────────────────────────────
+
+# Gauge bar: map gold_score from [-1, 1] to [0%, 100%] for the fill
+gauge_pct = (gold_score + 1.0) / 2.0 * 100  # -1 → 0%, 0 → 50%, +1 → 100%
+
+# Generate score history sparkline (wider than indicator sparklines)
+score_sparkline_svg = make_sparkline_svg(rolling_scores, n_days=90, width=180, height=40)
+
+_summary_html = (
+    '<div style="background:linear-gradient(135deg,#0f0f23 0%,#1a1a2e 100%);'
+    'border:1px solid #333;border-radius:12px;padding:24px 32px;margin-bottom:20px;">'
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:20px;">'
+    # Big score + sparkline
+    '<div style="flex:0 0 auto;text-align:center;min-width:200px;">'
+    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;">Gold Score</div>'
+    f'<div style="font-size:3.2rem;font-weight:800;color:{interp_color};line-height:1.1;'
+    f'font-family:\'SF Mono\',\'Fira Code\',monospace;">{gold_score:+.2f}</div>'
+    f'<div style="font-size:1.05rem;color:{interp_color};font-weight:600;margin-top:4px;">'
+    f'{interp_emoji} {interpretation}</div>'
+    '<div style="margin-top:8px;">'
+    '<div style="font-size:0.65rem;color:#666;margin-bottom:2px;">90-Day Score Trend</div>'
+    f'{score_sparkline_svg}'
+    '</div>'
+    '</div>'
+    # Score breakdown
+    '<div style="flex:1 1 280px;min-width:250px;">'
+    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Score Breakdown</div>'
+    '<table style="font-size:0.85rem;color:#d0d0d0;border-collapse:collapse;width:100%;">'
+    f'<tr><td style="padding:3px 0;color:#888;">Total Weighted Score</td>'
+    f'<td style="padding:3px 0;text-align:right;font-weight:600;font-family:monospace;">{overall_score:+.1f}</td></tr>'
+    f'<tr><td style="padding:3px 0;color:#888;">Max Possible Bullish</td>'
+    f'<td style="padding:3px 0;text-align:right;font-family:monospace;">{max_possible_score:.0f}</td></tr>'
+    f'<tr><td style="padding:3px 0;color:#888;">Max Possible Bearish</td>'
+    f'<td style="padding:3px 0;text-align:right;font-family:monospace;">-{max_possible_score:.0f}</td></tr>'
+    f'<tr style="border-top:1px solid #333;">'
+    f'<td style="padding:6px 0 3px 0;color:#888;">Normalized</td>'
+    f'<td style="padding:6px 0 3px 0;text-align:right;font-weight:700;color:{interp_color};font-family:monospace;">{gold_score:+.2f}</td></tr>'
+    '</table></div>'
+    # Interpretation scale
+    '<div style="flex:0 0 auto;min-width:220px;">'
+    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Interpretation Scale</div>'
+    '<table style="font-size:0.78rem;color:#aaa;border-collapse:collapse;">'
+    '<tr><td style="padding:2px 10px 2px 0;color:#ef4444;font-family:monospace;">-1.0 to -0.5</td><td>Strong Bearish</td></tr>'
+    '<tr><td style="padding:2px 10px 2px 0;color:#fca5a5;font-family:monospace;">-0.5 to -0.1</td><td>Bearish</td></tr>'
+    '<tr><td style="padding:2px 10px 2px 0;color:#facc15;font-family:monospace;">-0.1 to +0.1</td><td>Neutral</td></tr>'
+    '<tr><td style="padding:2px 10px 2px 0;color:#86efac;font-family:monospace;">+0.1 to +0.5</td><td>Bullish</td></tr>'
+    '<tr><td style="padding:2px 10px 2px 0;color:#22c55e;font-family:monospace;">+0.5 to +1.0</td><td>Strong Bullish</td></tr>'
+    '</table>'
+    f'<div style="margin-top:12px;font-size:0.75rem;color:#666;">'
+    f'{total_factors} factors &middot; {total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
+    '</div>'
+    '</div>'
+    # Gauge bar
+    '<div style="margin-top:18px;">'
+    '<div style="position:relative;height:18px;background:linear-gradient(to right,'
+    '#ef4444 0%,#fca5a5 25%,#facc15 45%,#facc15 55%,#86efac 75%,#22c55e 100%);'
+    'border-radius:9px;overflow:visible;">'
+    f'<div style="position:absolute;left:{gauge_pct:.1f}%;top:-3px;'
+    'transform:translateX(-50%);width:4px;height:24px;'
+    'background:white;border-radius:2px;box-shadow:0 0 6px rgba(255,255,255,0.6);"></div>'
+    '<div style="position:absolute;left:50%;top:-1px;transform:translateX(-50%);'
+    'width:1px;height:20px;background:rgba(0,0,0,0.4);"></div>'
+    '</div>'
+    '<div style="display:flex;justify-content:space-between;font-size:0.7rem;color:#666;margin-top:3px;">'
+    '<span>-1.0 Strong Bearish</span><span>0.0 Neutral</span><span>+1.0 Strong Bullish</span>'
+    '</div></div>'
+    '</div>'
+)
+st.markdown(_summary_html, unsafe_allow_html=True)
+
+# Confidence & error details
+col1, col2 = st.columns(2)
+col1.metric("Signal Confidence", f"{confidence_pct:.1f}%", help="Percentage of factors producing a decisive (non-neutral) signal")
+col2.metric("Decisive Signals", f"{decisive_signals} / {total_factors}", help="Factors with Green or Red signals vs total")
 
 # Clamp progress to [0.0, 1.0]
 st.progress(min(max(confidence_pct / 100.0, 0.0), 1.0))
@@ -585,6 +1159,358 @@ if fetch_errors:
     with st.expander(f"⚠️ Data Fetch Issues ({len(fetch_errors)})", expanded=False):
         for err in fetch_errors:
             st.text(f"  • {err}")
+
+# ─── Spot Prices Panel ──────────────────────────────────────────────────────
+st.subheader("Spot Precious Metals Prices")
+
+spot_metals = [
+    {"name": "Gold", "ticker": "GC=F", "icon": "🥇"},
+    {"name": "Silver", "ticker": "SI=F", "icon": "🥈"},
+    {"name": "Platinum", "ticker": "PL=F", "icon": "🏆"},
+]
+
+_spot_rows = ""
+for metal in spot_metals:
+    series = historical_data.get(metal["ticker"])
+    if series is not None and len(series) > 1:
+        current = float(series.iloc[-1])
+        prev = float(series.iloc[-2]) if len(series) > 1 else current
+        change = current - prev
+        change_pct = (change / prev * 100) if prev != 0 else 0
+        sparkline = make_sparkline_svg(series, n_days=50, width=160, height=32)
+
+        chg_color = "#22c55e" if change >= 0 else "#ef4444"
+        chg_arrow = "▲" if change >= 0 else "▼"
+    else:
+        current = 0
+        change = 0
+        change_pct = 0
+        sparkline = f'<svg width="160" height="32"></svg>'
+        chg_color = "#888"
+        chg_arrow = "—"
+
+    _spot_rows += (
+        '<div style="flex:1;min-width:240px;background:#1a1a2e;border:1px solid #333;'
+        'border-radius:10px;padding:16px 20px;text-align:center;">'
+        f'<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;">'
+        f'{metal["icon"]} {metal["name"]}</div>'
+        f'<div style="font-size:2rem;font-weight:700;color:#e0e0e0;'
+        f'font-family:\'SF Mono\',\'Fira Code\',monospace;margin:4px 0;">'
+        f'${current:,.2f}</div>'
+        f'<div style="font-size:0.9rem;color:{chg_color};font-weight:600;">'
+        f'{chg_arrow} ${abs(change):,.2f} ({change_pct:+.2f}%)</div>'
+        f'<div style="margin-top:8px;display:flex;justify-content:center;">'
+        f'<div style="display:inline-block;">'
+        f'<div style="font-size:0.6rem;color:#666;margin-bottom:2px;">50-Day Trend</div>'
+        f'{sparkline}</div></div>'
+        '</div>'
+    )
+
+_spot_html = (
+    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px;">'
+    f'{_spot_rows}'
+    '</div>'
+)
+st.markdown(_spot_html, unsafe_allow_html=True)
+
+# ─── Interactive Chart + Headlines (fully client-side JS) ────────────────────
+st.subheader("Gold Price vs Gold Score — Click timeline to filter headlines")
+
+gc_series = historical_data.get("GC=F")
+if gc_series is not None and len(rolling_scores) > 3:
+    import plotly.io as pio
+    import html as html_mod
+    import streamlit.components.v1 as components
+
+    # Align gold price to the rolling score date range
+    score_start = rolling_scores.index.min()
+    gc_chart = gc_series[gc_series.index >= score_start]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Scatter(
+            x=gc_chart.index, y=gc_chart.values,
+            name="Gold Price ($/oz)", mode="lines",
+            line=dict(color="#FFD700", width=2),
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=rolling_scores.index, y=rolling_scores.values,
+            name="Gold Score", mode="lines",
+            line=dict(color="#60a5fa", width=2, dash="dot"),
+        ),
+        secondary_y=True,
+    )
+    fig.add_hline(y=0, secondary_y=True, line_dash="dash",
+                  line_color="rgba(255,255,255,0.15)", line_width=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e0e1a",
+        height=480,
+        margin=dict(l=55, r=55, t=30, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="center", x=0.5, font=dict(size=11)),
+        hovermode="closest",
+    )
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", showgrid=True)
+    fig.update_yaxes(title_text="Gold $/oz", gridcolor="rgba(255,255,255,0.05)",
+                     showgrid=True, secondary_y=False, tickformat="$,.0f",
+                     title_font=dict(color="#FFD700", size=11))
+    fig.update_yaxes(title_text="Score", secondary_y=True, range=[-1.05, 1.05],
+                     tickformat="+.2f", title_font=dict(color="#60a5fa", size=11),
+                     gridcolor="rgba(255,255,255,0.03)")
+
+    chart_div_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False,
+                                  div_id="goldChart", config={"displayModeBar": False})
+
+    headlines_json = json.dumps([
+        {"date": h["date"],
+         "title": html_mod.escape(h.get("title", ""), quote=True),
+         "source": html_mod.escape(h.get("source", ""), quote=True),
+         "url": h.get("url", "")}
+        for h in headlines
+    ])
+
+    interactive_html = """
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: transparent; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+  .layout {
+    display: flex;
+    gap: 14px;
+    width: 100%;
+  }
+  /* Left: headlines panel */
+  .news-panel {
+    flex: 0 0 300px;
+    min-width: 280px;
+    background: #12121f;
+    border: 1px solid #333;
+    border-radius: 10px;
+    padding: 14px 16px;
+    max-height: 540px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .news-panel::-webkit-scrollbar { width: 5px; }
+  .news-panel::-webkit-scrollbar-track { background: #1a1a2e; border-radius: 5px; }
+  .news-panel::-webkit-scrollbar-thumb { background: #444; border-radius: 5px; }
+
+  .news-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    flex-shrink: 0;
+  }
+  .news-title { font-size: 0.88rem; font-weight: 700; color: #e0e0e0; }
+  .clear-btn {
+    background: #2a2a3a;
+    color: #facc15;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 2px 9px;
+    font-size: 0.68rem;
+    cursor: pointer;
+    display: none;
+    transition: background 0.15s;
+  }
+  .clear-btn:hover { background: #3a3a4a; }
+  .date-label {
+    font-size: 0.76rem;
+    color: #facc15;
+    margin-bottom: 8px;
+    display: none;
+    flex-shrink: 0;
+  }
+  .hint {
+    text-align: center;
+    font-size: 0.7rem;
+    color: #666;
+    padding: 6px 0;
+    flex-shrink: 0;
+  }
+  .news-list { flex: 1; overflow-y: auto; }
+
+  .day-header {
+    font-size: 0.76rem;
+    font-weight: 700;
+    color: #60a5fa;
+    margin-top: 10px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid #2a2a3a;
+    padding-bottom: 3px;
+  }
+  .headline-item {
+    font-size: 0.72rem;
+    color: #d0d0d0;
+    margin: 3px 0;
+    line-height: 1.4;
+  }
+  .headline-item a {
+    color: #d0d0d0;
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+  .headline-item a:hover { color: #60a5fa; }
+  .headline-src { color: #666; }
+  .news-footer {
+    font-size: 0.58rem;
+    color: #444;
+    margin-top: 10px;
+    border-top: 1px solid #2a2a3a;
+    padding-top: 5px;
+    flex-shrink: 0;
+  }
+
+  /* Right: chart */
+  .chart-panel {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+  }
+  .chart-panel .js-plotly-plot { cursor: crosshair !important; }
+
+  /* Responsive: stack on narrow screens */
+  @media (max-width: 800px) {
+    .layout { flex-direction: column-reverse; }
+    .news-panel { flex: none; max-height: 320px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- LEFT: Headlines -->
+  <div class="news-panel">
+    <div class="news-header">
+      <div class="news-title">&#x1F4F0; Headlines & Events</div>
+      <button class="clear-btn" id="clearBtn" onclick="clearFilter()">&#x2715; Reset</button>
+    </div>
+    <div class="date-label" id="dateLabel"></div>
+    <div class="hint" id="hintText">Click on the chart to filter by date</div>
+    <div class="news-list" id="newsList"></div>
+    <div class="news-footer">Sources: Google News RSS &middot; Federal Reserve FOMC Calendar</div>
+  </div>
+  <!-- RIGHT: Chart -->
+  <div class="chart-panel">
+    """ + chart_div_html + """
+  </div>
+</div>
+
+<script>
+var ALL_HEADLINES = """ + headlines_json + """;
+
+function renderHeadlines(clickedDate) {
+    var list = document.getElementById("newsList");
+    var lbl  = document.getElementById("dateLabel");
+    var btn  = document.getElementById("clearBtn");
+    var hint = document.getElementById("hintText");
+    if (!list) return;
+
+    var filtered;
+    if (clickedDate) {
+        var fd = clickedDate.split("T")[0];
+        // Show headlines on the clicked day and PRIOR
+        filtered = ALL_HEADLINES.filter(function(h){ return h.date <= fd; });
+        lbl.innerHTML = "&#x1F4CC; Headlines up to <b>" + fd + "</b>";
+        lbl.style.display = "block";
+        btn.style.display = "inline-block";
+        hint.style.display = "none";
+    } else {
+        filtered = ALL_HEADLINES;
+        lbl.style.display = "none";
+        btn.style.display = "none";
+        hint.style.display = "block";
+    }
+
+    // Group by date descending
+    var groups = {};
+    var dateOrder = [];
+    filtered.forEach(function(h){
+        if (!groups[h.date]) { groups[h.date] = []; dateOrder.push(h.date); }
+        groups[h.date].push(h);
+    });
+    // Sort dates descending (most recent first)
+    dateOrder.sort(function(a,b){ return b.localeCompare(a); });
+
+    var out = "";
+    var shown = 0;
+    for (var i = 0; i < dateOrder.length && shown < 20; i++) {
+        var d = dateOrder[i];
+        var items = groups[d];
+        var dt = new Date(d + "T12:00:00");
+        var nice = dt.toLocaleDateString("en-US", {year:"numeric",month:"short",day:"numeric",weekday:"short"});
+
+        out += '<div class="day-header">' + nice + '</div>';
+        var mx = Math.min(items.length, 5);
+        for (var j = 0; j < mx; j++) {
+            var h = items[j];
+            var src = h.source ? ' <span class="headline-src">&mdash; ' + h.source + '</span>' : "";
+            if (h.url) {
+                out += '<div class="headline-item">&bull; <a href="' + h.url + '" target="_blank">' + h.title + '</a>' + src + '</div>';
+            } else {
+                out += '<div class="headline-item">&bull; ' + h.title + src + '</div>';
+            }
+        }
+        shown++;
+    }
+    if (!out) {
+        out = '<div style="color:#666;padding:12px 0;font-size:0.76rem;">No headlines for this period.</div>';
+    }
+    list.innerHTML = out;
+    // Scroll to top of list
+    list.scrollTop = 0;
+}
+
+function clearFilter() {
+    renderHeadlines(null);
+}
+
+// Initial render
+renderHeadlines(null);
+
+// Attach plotly_click — poll until the chart is ready, then listen continuously
+(function() {
+    var ready = false;
+    function tryAttach() {
+        var gd = document.getElementById("goldChart");
+        if (!gd || !gd._fullLayout) {
+            setTimeout(tryAttach, 150);
+            return;
+        }
+        if (ready) return;
+        ready = true;
+
+        // Use Plotly's own event system which fires on every click
+        gd.on("plotly_click", function(evtData) {
+            if (evtData && evtData.points && evtData.points.length > 0) {
+                renderHeadlines(String(evtData.points[0].x));
+            }
+        });
+    }
+    tryAttach();
+})();
+</script>
+</body>
+</html>
+"""
+
+    components.html(interactive_html, height=580, scrolling=False)
+
+else:
+    st.info("Insufficient data to render dual-axis chart.")
+
+st.divider()
 
 # ─── CSS for hover tooltips ──────────────────────────────────────────────────
 st.markdown("""
@@ -668,23 +1594,27 @@ st.markdown("""
 .score-neg { color: #ef4444; font-weight: 600; }
 .score-zero { color: #888; }
 .val-cell { font-weight: 600; font-family: 'SF Mono', 'Fira Code', monospace; }
+.spark-cell { padding: 4px 6px !important; vertical-align: middle; min-width: 130px; }
+.spark-cell svg { display: block; }
 </style>
 """, unsafe_allow_html=True)
 
 
 def render_category_table(cat_df):
-    """Render a category table as HTML with hover tooltips on indicator names."""
-    cols = ["Indicator", "Ticker / Source", "Value", "5Y Mean", "Z-Score",
+    """Render a category table as HTML with hover tooltips on indicator names and sparklines."""
+    cols = ["Indicator", "Ticker / Source", "Value", "Sparkline", "5Y Mean", "Z-Score",
             "Percentile", "Colour Indicator", "Total Factor Score"]
+
+    header_labels = {
+        "Colour Indicator": "Signal",
+        "Total Factor Score": "Score",
+        "Sparkline": "50D Trend"
+    }
 
     html = '<table class="factor-table">'
     html += '<tr>'
     for c in cols:
-        label = c
-        if c == "Colour Indicator":
-            label = "Signal"
-        elif c == "Total Factor Score":
-            label = "Score"
+        label = header_labels.get(c, c)
         html += f'<th>{label}</th>'
     html += '</tr>'
 
@@ -713,6 +1643,10 @@ def render_category_table(cat_df):
                         html += f'<div class="tt-why">Why it matters: {esc(why)}</div>'
                     html += '</div>'
                 html += '</td>'
+
+            elif c == "Sparkline":
+                # Insert the pre-built SVG sparkline directly (trusted HTML)
+                html += f'<td class="spark-cell">{val}</td>'
 
             elif c == "Colour Indicator":
                 css = {"Green": "sig-green", "Red": "sig-red", "Yellow": "sig-yellow"}.get(val, "")
