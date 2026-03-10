@@ -6,3 +6,6 @@ fredapi
 requests
 beautifulsoup4
 rich
+pytrends
+plotly
+xlrd
