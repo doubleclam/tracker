@@ -845,8 +845,57 @@ def fetch_market_headlines():
                 'datetime': d,
                 'title': label,
                 'source': 'Federal Reserve',
-                'url': 'https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm'
+                'url': 'https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm',
+                'upcoming': d > pd.Timestamp(now)
             })
+
+    # Approach 3: Fetch upcoming macro indicator releases from FRED API
+    macro_releases = {
+        10:  ("CPI Release", "Bureau of Labor Statistics"),
+        50:  ("Employment Situation (NFP)", "Bureau of Labor Statistics"),
+        53:  ("GDP Report", "Bureau of Economic Analysis"),
+        54:  ("PCE / Personal Income", "Bureau of Economic Analysis"),
+        124: ("PPI Release", "Bureau of Labor Statistics"),
+        46:  ("Durable Goods Orders", "U.S. Census Bureau"),
+        27:  ("Retail Sales", "U.S. Census Bureau"),
+        18:  ("Industrial Production", "Federal Reserve"),
+        21:  ("FOMC Minutes", "Federal Reserve"),
+        82:  ("Treasury Budget", "U.S. Treasury"),
+        19:  ("Consumer Confidence", "Conference Board"),
+        29:  ("ISM Manufacturing PMI", "ISM"),
+    }
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    future_str = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
+    past_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+
+    for release_id, (label, source) in macro_releases.items():
+        try:
+            url = (
+                f"https://api.stlouisfed.org/fred/release/dates"
+                f"?release_id={release_id}"
+                f"&api_key={FRED_API_KEY}"
+                f"&file_type=json"
+                f"&include_release_dates_with_no_data=true"
+                f"&sort_order=asc"
+            )
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200:
+                dates_data = resp.json().get("release_dates", [])
+                for entry in dates_data:
+                    rd = entry.get("date", "")
+                    if past_str <= rd <= future_str:
+                        is_upcoming = rd >= today_str
+                        tag = " (Upcoming)" if is_upcoming else ""
+                        headlines.append({
+                            'date': rd,
+                            'datetime': pd.Timestamp(rd),
+                            'title': f"{label}{tag}",
+                            'source': source,
+                            'url': '',
+                            'upcoming': is_upcoming
+                        })
+        except Exception:
+            continue
 
     # Sort by date descending
     headlines.sort(key=lambda x: x.get('datetime', pd.Timestamp('2000-01-01')), reverse=True)
@@ -1161,6 +1210,7 @@ if gc_series is not None and len(rolling_scores) > 3:
             x=gc_chart.index, y=gc_chart.values,
             name="Gold Price ($/oz)", mode="lines",
             line=dict(color="#FFD700", width=2),
+            hovertemplate="<b>Gold Price</b><br>%{x|%b %d, %Y}<br>$%{y:,.0f}<extra></extra>",
         ),
         secondary_y=False,
     )
@@ -1169,6 +1219,7 @@ if gc_series is not None and len(rolling_scores) > 3:
             x=rolling_scores.index, y=rolling_scores.values,
             name="Gold Score", mode="lines",
             line=dict(color="#60a5fa", width=2, dash="dot"),
+            hovertemplate="<b>Gold Score</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
         ),
         secondary_y=True,
     )
@@ -1184,10 +1235,14 @@ if gc_series is not None and len(rolling_scores) > 3:
         margin=dict(l=55, r=55, t=30, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="center", x=0.5, font=dict(size=11)),
-        hovermode="closest",
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="rgba(15,15,35,0.9)", font_size=12, font_color="#d0d0d0"),
     )
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", showgrid=True,
-                     tickfont=dict(color="#aaa"))
+                     tickfont=dict(color="#aaa"),
+                     showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikecolor="rgba(255,255,255,0.3)",
+                     spikedash="dot")
     fig.update_yaxes(title_text="Gold $/oz", gridcolor="rgba(255,255,255,0.05)",
                      showgrid=True, secondary_y=False, tickformat="$,.0f",
                      title_font=dict(color="#FFD700", size=11),
@@ -1204,7 +1259,8 @@ if gc_series is not None and len(rolling_scores) > 3:
         {"date": h["date"],
          "title": html_mod.escape(h.get("title", ""), quote=True),
          "source": html_mod.escape(h.get("source", ""), quote=True),
-         "url": h.get("url", "")}
+         "url": h.get("url", ""),
+         "upcoming": h.get("upcoming", False)}
         for h in headlines
     ])
 
@@ -1296,6 +1352,22 @@ if gc_series is not None and len(rolling_scores) > 3:
   }
   .headline-item a:hover { color: #60a5fa; }
   .headline-src { color: #666; }
+  .headline-upcoming {
+    color: #fbbf24;
+    font-style: italic;
+  }
+  .headline-upcoming::before {
+    content: "📅 ";
+  }
+  .upcoming-tag {
+    font-size: 0.55rem;
+    background: rgba(251,191,36,0.15);
+    color: #fbbf24;
+    padding: 1px 5px;
+    border-radius: 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
   .news-footer {
     font-size: 0.58rem;
     color: #444;
@@ -1331,7 +1403,7 @@ if gc_series is not None and len(rolling_scores) > 3:
     <div class="date-label" id="dateLabel"></div>
     <div class="hint" id="hintText">Click on the chart to filter by date</div>
     <div class="news-list" id="newsList"></div>
-    <div class="news-footer">Sources: Google News RSS &middot; Federal Reserve FOMC Calendar</div>
+    <div class="news-footer">Sources: Google News RSS &middot; FRED Release Calendar &middot; Federal Reserve</div>
   </div>
   <!-- RIGHT: Chart -->
   <div class="chart-panel">
@@ -1365,15 +1437,25 @@ function renderHeadlines(clickedDate) {
         hint.style.display = "block";
     }
 
-    // Group by date descending
+    // Separate upcoming from past, then group by date
+    var upcoming = filtered.filter(function(h){ return h.upcoming; });
+    var past = filtered.filter(function(h){ return !h.upcoming; });
+
+    // Group by date
     var groups = {};
     var dateOrder = [];
-    filtered.forEach(function(h){
+    // Upcoming dates first (ascending — soonest first)
+    upcoming.sort(function(a,b){ return a.date.localeCompare(b.date); });
+    upcoming.forEach(function(h){
         if (!groups[h.date]) { groups[h.date] = []; dateOrder.push(h.date); }
         groups[h.date].push(h);
     });
-    // Sort dates descending (most recent first)
-    dateOrder.sort(function(a,b){ return b.localeCompare(a); });
+    // Then past dates (descending — most recent first)
+    past.forEach(function(h){
+        if (!groups[h.date]) { groups[h.date] = []; dateOrder.push(h.date); }
+        groups[h.date].push(h);
+    });
+    // dateOrder already has upcoming (asc) then past (desc) — no re-sort needed
 
     var out = "";
     var shown = 0;
@@ -1382,16 +1464,23 @@ function renderHeadlines(clickedDate) {
         var items = groups[d];
         var dt = new Date(d + "T12:00:00");
         var nice = dt.toLocaleDateString("en-US", {year:"numeric",month:"short",day:"numeric",weekday:"short"});
+        var isUpcomingDay = items.some(function(h){ return h.upcoming; });
 
-        out += '<div class="day-header">' + nice + '</div>';
+        if (isUpcomingDay) {
+            out += '<div class="day-header" style="color:#fbbf24;">' + nice + '</div>';
+        } else {
+            out += '<div class="day-header">' + nice + '</div>';
+        }
         var mx = Math.min(items.length, 5);
         for (var j = 0; j < mx; j++) {
             var h = items[j];
             var src = h.source ? ' <span class="headline-src">&mdash; ' + h.source + '</span>' : "";
+            var tag = h.upcoming ? '<span class="upcoming-tag">UPCOMING</span>' : "";
+            var cls = h.upcoming ? "headline-item headline-upcoming" : "headline-item";
             if (h.url) {
-                out += '<div class="headline-item">&bull; <a href="' + h.url + '" target="_blank">' + h.title + '</a>' + src + '</div>';
+                out += '<div class="' + cls + '">&bull; <a href="' + h.url + '" target="_blank">' + h.title + '</a>' + tag + src + '</div>';
             } else {
-                out += '<div class="headline-item">&bull; ' + h.title + src + '</div>';
+                out += '<div class="' + cls + '">&bull; ' + h.title + tag + src + '</div>';
             }
         }
         shown++;
@@ -1428,6 +1517,42 @@ renderHeadlines(null);
             if (evtData && evtData.points && evtData.points.length > 0) {
                 renderHeadlines(String(evtData.points[0].x));
             }
+        });
+
+        // Hover dots — draw SVG circles on each trace at the hovered x position
+        var dotColors = ["#FFD700", "#60a5fa"];
+
+        gd.on("plotly_hover", function(evtData) {
+            // Remove previous dots
+            gd.querySelectorAll(".hover-dot").forEach(function(el){ el.remove(); });
+            if (!evtData || !evtData.points) return;
+            var svg = gd.querySelector(".main-svg");
+            if (!svg) return;
+
+            evtData.points.forEach(function(pt) {
+                var xa = gd._fullLayout.xaxis;
+                var yaKey = pt.fullData.yaxis === "y2" ? "yaxis2" : "yaxis";
+                var ya = gd._fullLayout[yaKey];
+                if (!xa || !ya) return;
+
+                var px = xa.l2p(xa.d2c(pt.x)) + xa._offset;
+                var py = ya.l2p(pt.y) + ya._offset;
+
+                var dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                dot.setAttribute("cx", px);
+                dot.setAttribute("cy", py);
+                dot.setAttribute("r", 5);
+                dot.setAttribute("fill", dotColors[pt.traceIndex] || "#fff");
+                dot.setAttribute("stroke", "#fff");
+                dot.setAttribute("stroke-width", "1.5");
+                dot.setAttribute("class", "hover-dot");
+                dot.setAttribute("pointer-events", "none");
+                svg.appendChild(dot);
+            });
+        });
+
+        gd.on("plotly_unhover", function() {
+            gd.querySelectorAll(".hover-dot").forEach(function(el){ el.remove(); });
         });
     }
     tryAttach();
