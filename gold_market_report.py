@@ -5,6 +5,7 @@ Calculates 5Y Means, Z-Scores, and Percentiles dynamically from historical API d
 """
 
 import os
+import io
 import ssl
 import re
 import json
@@ -28,11 +29,62 @@ fred = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
 
 st.set_page_config(page_title="Market Intelligence: Gold", layout="wide")
 
-# FT-style page background
+# ─── Global CSS: Mobile-First + Dark Theme ───────────────────────────────────
+# Forces dark color-scheme for iOS Safari (fixes color rendering on iPhone),
+# adds viewport-safe sizing, and comprehensive mobile breakpoints.
 st.markdown("""
 <style>
+    /* Force dark color scheme for iOS Safari / mobile browsers */
+    :root {
+        color-scheme: dark;
+        -webkit-text-size-adjust: 100%;
+    }
+    html, body, .stApp {
+        background-color: #0f0f23 !important;
+        color: #d0d0d0 !important;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
     .stApp {
-        background-color: #FFF1E5;
+        background-color: #0f0f23 !important;
+    }
+
+    /* Prevent horizontal overflow on mobile */
+    .stMainBlockContainer, .block-container, .stVerticalBlock {
+        max-width: 100vw !important;
+        overflow-x: hidden !important;
+    }
+
+    /* Mobile: tighten Streamlit's default padding */
+    @media (max-width: 768px) {
+        .stMainBlockContainer, .block-container {
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+            padding-top: 1rem !important;
+        }
+        /* Streamlit header / toolbar — reduce on mobile */
+        header[data-testid="stHeader"] {
+            padding: 0.25rem 0.5rem !important;
+        }
+        /* Subheaders smaller on mobile */
+        .stSubheader, h2, h3 {
+            font-size: 1.05rem !important;
+            line-height: 1.3 !important;
+        }
+        /* Metrics compact on mobile */
+        [data-testid="stMetric"] {
+            padding: 0.3rem 0 !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.1rem !important;
+        }
+        /* Dividers thinner */
+        hr {
+            margin: 0.5rem 0 !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -182,7 +234,12 @@ def fetch_historical_data():
         fred_tickers = [
             "DFII10", "DFII5", "T5YIE", "MICH", "M2SL", "GFDEGDQ188S",
             "FYFSGDA188S", "A091RC1Q027SBEA", "T10Y2Y", "BAMLH0A0HYM2",
-            "TEDRATE", "RRPONTSYD", "TOTRESNS"
+            "TEDRATE", "RRPONTSYD", "TOTRESNS",
+            # Additional series for computed indicators
+            "FEDFUNDS", "SOFR", "DFF",
+            "DGS10", "CPIAUCSL", "EXPINF1YR",
+            "IRLTLT01DEM156N", "IRLTLT01JPM156N", "IRLTLT01GBM156N",
+            "DEUCPIALLMINMEI", "JPNCPIALLMINMEI", "GBRCPIALLMINMEI",
         ]
         for t in fred_tickers:
             try:
@@ -197,10 +254,9 @@ def fetch_historical_data():
 
         # Compute Fed Funds Real Rate = FEDFUNDS - T5YIE (inflation expectations)
         try:
-            fedfunds = fred.get_series("FEDFUNDS", observation_start=start_date).dropna()
+            fedfunds = hist_data.get("FEDFUNDS")
             t5yie = hist_data.get("T5YIE")
-            if t5yie is not None and len(fedfunds) > 0:
-                # Align monthly fed funds to daily inflation expectations
+            if fedfunds is not None and t5yie is not None and len(fedfunds) > 0:
                 fedfunds_daily = fedfunds.reindex(t5yie.index, method="ffill")
                 real_ff = (fedfunds_daily - t5yie).dropna()
                 if len(real_ff) > 10:
@@ -223,20 +279,63 @@ def fetch_historical_data():
         if "FYFSGDA188S" in hist_data:
             hist_data["FYFSGDA188S"] = -hist_data["FYFSGDA188S"]
 
-    # 1B. Fetch SOFR and DFF (Fed Funds Daily) from FRED for SOFR-OIS spread
+    # 1B. Compute SOFR-OIS spread from already-fetched FRED data
     if fred:
         try:
-            sofr = fred.get_series("SOFR", observation_start=start_date).dropna()
-            dff = fred.get_series("DFF", observation_start=start_date).dropna()
-            if len(sofr) > 10 and len(dff) > 10:
+            sofr = hist_data.get("SOFR")
+            dff = hist_data.get("DFF")
+            if sofr is not None and dff is not None and len(sofr) > 10 and len(dff) > 10:
                 aligned_rates = pd.concat([sofr, dff], axis=1).dropna()
                 aligned_rates.columns = ["SOFR", "DFF"]
-                # Spread in basis points
                 sofr_ois = (aligned_rates["SOFR"] - aligned_rates["DFF"]) * 100
                 if len(sofr_ois) > 10:
                     hist_data["SOFR_OIS"] = sofr_ois
         except Exception as e:
             fetch_errors.append(f"SOFR-OIS calc: {e}")
+
+    # 1B2. Compute additional indicators from already-fetched FRED data
+    if fred:
+        # Global Real Rates (GDP-weighted: US 45%, EU 25%, Japan 15%, UK 15%)
+        try:
+            us_nom = hist_data.get("DGS10")
+            de_nom = hist_data.get("IRLTLT01DEM156N")
+            jp_nom = hist_data.get("IRLTLT01JPM156N")
+            gb_nom = hist_data.get("IRLTLT01GBM156N")
+            us_cpi = hist_data.get("CPIAUCSL")
+
+            if all(v is not None for v in [us_nom, de_nom, jp_nom, gb_nom, us_cpi]):
+                us_infl = us_cpi.pct_change(12) * 100
+                us_infl = us_infl.dropna()
+
+                de_cpi = hist_data.get("DEUCPIALLMINMEI")
+                jp_cpi = hist_data.get("JPNCPIALLMINMEI")
+                gb_cpi = hist_data.get("GBRCPIALLMINMEI")
+
+                if all(v is not None for v in [de_cpi, jp_cpi, gb_cpi]):
+                    de_infl = de_cpi.pct_change(12) * 100
+                    jp_infl = jp_cpi.pct_change(12) * 100
+                    gb_infl = gb_cpi.pct_change(12) * 100
+
+                    us_real = (us_nom - us_infl.reindex(us_nom.index, method="ffill")).dropna()
+                    de_real = (de_nom - de_infl.reindex(de_nom.index, method="ffill")).dropna()
+                    jp_real = (jp_nom - jp_infl.reindex(jp_nom.index, method="ffill")).dropna()
+                    gb_real = (gb_nom - gb_infl.reindex(gb_nom.index, method="ffill")).dropna()
+
+                    glb = pd.concat([us_real, de_real, jp_real, gb_real], axis=1).dropna()
+                    glb.columns = ["US", "DE", "JP", "GB"]
+                    glb_weighted = glb["US"] * 0.45 + glb["DE"] * 0.25 + glb["JP"] * 0.15 + glb["GB"] * 0.15
+                    if len(glb_weighted) > 10:
+                        hist_data["GLB_REAL"] = glb_weighted
+        except Exception as e:
+            fetch_errors.append(f"GLB_REAL calc: {e}")
+
+        # Cleveland Fed Inflation Nowcast (1-Year Expected Inflation)
+        clev = hist_data.get("EXPINF1YR")
+        if clev is not None and len(clev) > 10:
+            hist_data["CLEV_INFL"] = clev
+
+        # Flag M2 data for Gold Allocation calculation after YF data
+        hist_data["_AU_ALLOC_M2"] = hist_data.get("M2SL")
 
     # 1C. Fetch Geopolitical Risk Index (Caldara-Iacoviello)
     try:
@@ -300,7 +399,7 @@ def fetch_historical_data():
     yf_tickers = [
         "DX-Y.NYB", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
         "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ",
-        "PA=F", "HG=F",
+        "PA=F", "HG=F", "^SKEW",
         "EUR=X", "GBPUSD=X", "JPY=X", "CNY=X"
     ]
     try:
@@ -511,8 +610,88 @@ def fetch_historical_data():
         except Exception as e:
             fetch_errors.append(f"VOL_PROF calc: {e}")
 
+        # Compute EFP Spread: COMEX futures minus spot proxy (GLD * conversion)
+        # GLD tracks spot gold; converting to $/oz gives a spot proxy
+        if "GC=F" in hist_data and "GLD" in hist_data:
+            try:
+                gc = hist_data["GC=F"]
+                gld = hist_data["GLD"]
+                conv = gc.iloc[0] / gld.iloc[0] if gld.iloc[0] != 0 else 10.0
+                spot_proxy = gld * conv
+                efp = (gc - spot_proxy).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(efp) > 10:
+                    hist_data["EFP_SPREAD"] = efp
+            except Exception as e:
+                fetch_errors.append(f"EFP_SPREAD calc: {e}")
+
+        # Compute Gold Allocation proxy: gold market cap as % of US M2 * 4 (global estimate)
+        # Total above-ground gold ≈ 210,000 tonnes = ~6.75 billion troy oz
+        if "GC=F" in hist_data and hist_data.get("_AU_ALLOC_M2") is not None:
+            try:
+                gc = hist_data["GC=F"]
+                m2 = hist_data["_AU_ALLOC_M2"]
+                m2_daily = m2.resample("D").ffill()
+                aligned_alloc = pd.concat([gc, m2_daily], axis=1).dropna()
+                aligned_alloc.columns = ["gold_price", "m2"]
+                # Gold market cap in $B: price * 6.75B oz / 1e9
+                gold_mktcap = aligned_alloc["gold_price"] * 6.75
+                # Global financial assets proxy: M2 * 4 (US is ~25% of global)
+                global_assets = aligned_alloc["m2"] * 4
+                au_alloc = (gold_mktcap / global_assets) * 100  # as percentage
+                au_alloc = au_alloc.dropna()
+                if len(au_alloc) > 10:
+                    hist_data["AU_ALLOCATION"] = au_alloc
+            except Exception as e:
+                fetch_errors.append(f"AU_ALLOCATION calc: {e}")
+
+        # Options Skew: use CBOE SKEW index as proxy for market tail risk
+        if "^SKEW" in hist_data:
+            hist_data["OPT_SKEW"] = hist_data["^SKEW"]
+
+        # Compute Implied Lease Rate: SOFR minus gold forward rate from futures curve
+        if "GC=F" in hist_data and "GLD" in hist_data and "SOFR_OIS" in hist_data:
+            try:
+                gc = hist_data["GC=F"]
+                gld = hist_data["GLD"]
+                sofr_ois = hist_data["SOFR_OIS"]
+                # Gold forward rate proxy: (futures / spot proxy - 1) * annualized
+                conv = gc.iloc[0] / gld.iloc[0] if gld.iloc[0] != 0 else 10.0
+                spot_proxy = gld * conv
+                fwd_rate = ((gc / spot_proxy) - 1) * 365 / 60 * 100  # annualized %
+                fwd_rate = fwd_rate.replace([np.inf, -np.inf], np.nan).dropna()
+                # Lease rate = SOFR - gold forward rate
+                sofr_daily = sofr_ois.reindex(fwd_rate.index, method="ffill") / 100  # convert bps to %
+                lease = sofr_daily - fwd_rate
+                lease = lease.dropna()
+                if len(lease) > 10:
+                    hist_data["LEASE_RATE"] = lease
+            except Exception as e:
+                fetch_errors.append(f"LEASE_RATE calc: {e}")
+
     except Exception as e:
         fetch_errors.append(f"YF bulk download: {e}")
+
+    # 2B. Fetch COMEX warehouse inventory from CME
+    try:
+        comex_url = "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls"
+        comex_resp = requests.get(comex_url, timeout=10,
+                                   headers={"User-Agent": "Mozilla/5.0"})
+        if comex_resp.status_code == 200:
+            comex_df = pd.read_excel(io.BytesIO(comex_resp.content), engine="xlrd",
+                                      header=None, skiprows=4)
+            for _, row_data in comex_df.iterrows():
+                if str(row_data.iloc[0]).strip().upper() == "TOTAL":
+                    try:
+                        reg = float(str(row_data.iloc[2]).replace(",", ""))
+                        elig = float(str(row_data.iloc[4]).replace(",", ""))
+                        total_oz = (reg + elig) / 1_000_000  # convert to M oz
+                        dates = pd.date_range(start=start_date, end=end_date, freq='B')
+                        hist_data["COMEX_INV"] = pd.Series(total_oz, index=dates)
+                    except Exception:
+                        pass
+                    break
+    except Exception as e:
+        fetch_errors.append(f"COMEX_INV: {e}")
 
     # 3. Simulate remaining factors that have no free API source
     # These use random walks as placeholders until real data sources are connected.
@@ -648,19 +827,18 @@ def calculate_statistics(series, config):
     unit = config.get("unit", "")
     if series is None or len(series) < 10:
         return {"Value": "N/A", "Colour Indicator": "Yellow", "Total Factor Score": 0,
-                "Change": "N/A", "Change Color": "gray"}
+                "Change": "N/A", "Change Color": "gray", "Change Pct": 0.0}
 
     current_val = float(series.iloc[-1])
     mean_5y = float(series.mean())
     std_5y = float(series.std())
 
     # Period-over-period % change (daily or weekly depending on data frequency)
+    change_pct = 0.0
     if len(series) >= 2:
         prev_val = float(series.iloc[-2])
         if abs(prev_val) > 1e-10:
             change_pct = (current_val - prev_val) / abs(prev_val) * 100
-        else:
-            change_pct = 0.0
         if change_pct > 0.005:
             change_str = f"▲ +{change_pct:.2f}%"
             change_color = "green"
@@ -703,6 +881,7 @@ def calculate_statistics(series, config):
         "Value": format_value_with_unit(current_val, unit),
         "Change": change_str,
         "Change Color": change_color,
+        "Change Pct": change_pct,
         "5Y Mean": format_value_with_unit(mean_5y, unit),
         "5Y Std": f"{std_5y:.2f}",
         "Z-Score": f"{z_score:.2f}",
@@ -876,9 +1055,10 @@ def fetch_market_headlines():
                 f"&api_key={FRED_API_KEY}"
                 f"&file_type=json"
                 f"&include_release_dates_with_no_data=true"
-                f"&sort_order=asc"
+                f"&sort_order=desc"
+                f"&limit=5"
             )
-            resp = requests.get(url, timeout=8)
+            resp = requests.get(url, timeout=4)
             if resp.status_code == 200:
                 dates_data = resp.json().get("release_dates", [])
                 for entry in dates_data:
@@ -924,12 +1104,9 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
             stats = calculate_statistics(series, item)
 
             # Determine actual data source status
-            is_computed_live = ticker in historical_data and not (
-                item['source'] == 'SIMULATED' and ticker not in [
-                    "FEDFUNDS_REAL", "AU_M2", "SI_BETA"
-                ]
-            )
-            if item['source'] == 'SIMULATED' and not is_computed_live:
+            if item['source'] == 'SIMULATED' and (series is None or ticker not in historical_data):
+                source_label = f"{ticker} (Simulated)"
+            elif item['source'] == 'SIMULATED' and ticker in historical_data:
                 source_label = f"{ticker} (Simulated)"
             elif series is not None and len(series) >= 10:
                 source_label = f"{ticker} ({item['source']})"
@@ -944,10 +1121,12 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
                 "Indicator": item['ind'],
                 "Cluster Group": item.get('cluster_group', ''),
                 "Definition": item.get('definition', ''),
+                "Unit": item.get('unit', ''),
                 "Ticker / Source": source_label,
                 "Value": stats["Value"],
                 "Change": stats.get("Change", "N/A"),
                 "Change Color": stats.get("Change Color", "gray"),
+                "Change Pct": stats.get("Change Pct", 0.0),
                 "Sparkline": sparkline_svg,
                 "Colour Indicator": stats["Colour Indicator"],
                 "Total Factor Score": stats["Total Factor Score"],
@@ -980,12 +1159,10 @@ if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any
     overall_score = float(cluster_scores.sum())
 
     # Max possible per cluster = max(weight*3) of factors in that cluster
-    # (since we average within cluster, the max avg approaches the heaviest factor's max)
     cluster_max = {}
     for _, row in final_df.iterrows():
         cg = row.get('Cluster Group', '')
         w = 0
-        # Look up the weight from FACTOR_CONFIG
         for indicators in FACTOR_CONFIG.values():
             for item in indicators:
                 if item['ind'] == row['Indicator']:
@@ -1057,66 +1234,191 @@ gauge_pct = (gold_score + 1.0) / 2.0 * 100  # -1 → 0%, 0 → 50%, +1 → 100%
 score_sparkline_svg = make_sparkline_svg(rolling_scores, n_days=90, width=180, height=40)
 
 _summary_html = (
-    '<div style="background:linear-gradient(135deg,#0f0f23 0%,#1a1a2e 100%);'
-    'border:1px solid #333;border-radius:12px;padding:24px 32px;margin-bottom:20px;">'
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:20px;">'
+    '<div class="summary-panel">'
+    '<div class="summary-flex">'
     # Big score + sparkline
-    '<div style="flex:0 0 auto;text-align:center;min-width:200px;">'
-    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;">Gold Score</div>'
-    f'<div style="font-size:3.2rem;font-weight:800;color:{interp_color};line-height:1.1;'
-    f'font-family:\'SF Mono\',\'Fira Code\',monospace;">{gold_score:+.2f}</div>'
-    f'<div style="font-size:1.05rem;color:{interp_color};font-weight:600;margin-top:4px;">'
+    '<div class="summary-score-block">'
+    '<div class="summary-label">Gold Score</div>'
+    f'<div class="summary-score-value" style="color:{interp_color};">{gold_score:+.2f}</div>'
+    f'<div class="summary-interp" style="color:{interp_color};">'
     f'{interp_emoji} {interpretation}</div>'
-    f'<div style="font-size:0.9rem;color:{score_chg_color};font-weight:600;margin-top:6px;'
-    f'font-family:\'SF Mono\',\'Fira Code\',monospace;">{score_chg_str}</div>'
+    f'<div class="summary-chg" style="color:{score_chg_color};">{score_chg_str}</div>'
     '<div style="margin-top:8px;">'
     '<div style="font-size:0.65rem;color:#666;margin-bottom:2px;">90-Day Score Trend</div>'
     f'{score_sparkline_svg}'
     '</div>'
     '</div>'
     # Score breakdown
-    '<div style="flex:1 1 280px;min-width:250px;">'
-    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Score Breakdown</div>'
-    '<table style="font-size:0.85rem;color:#d0d0d0;border-collapse:collapse;width:100%;">'
-    f'<tr><td style="padding:3px 0;color:#888;">Total Weighted Score</td>'
-    f'<td style="padding:3px 0;text-align:right;font-weight:600;font-family:monospace;">{overall_score:+.1f}</td></tr>'
-    f'<tr><td style="padding:3px 0;color:#888;">Max Possible Bullish</td>'
-    f'<td style="padding:3px 0;text-align:right;font-family:monospace;">{max_possible_score:.0f}</td></tr>'
-    f'<tr><td style="padding:3px 0;color:#888;">Max Possible Bearish</td>'
-    f'<td style="padding:3px 0;text-align:right;font-family:monospace;">-{max_possible_score:.0f}</td></tr>'
+    '<div class="summary-breakdown">'
+    '<div class="summary-label" style="margin-bottom:10px;">Score Breakdown</div>'
+    '<table class="summary-table">'
+    f'<tr><td>Total Weighted Score</td>'
+    f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td></tr>'
+    f'<tr><td>Max Possible Bullish</td>'
+    f'<td class="summary-td-right">{max_possible_score:.0f}</td></tr>'
+    f'<tr><td>Max Possible Bearish</td>'
+    f'<td class="summary-td-right">-{max_possible_score:.0f}</td></tr>'
     f'<tr style="border-top:1px solid #333;">'
-    f'<td style="padding:6px 0 3px 0;color:#888;">Normalized</td>'
-    f'<td style="padding:6px 0 3px 0;text-align:right;font-weight:700;color:{interp_color};font-family:monospace;">{gold_score:+.2f}</td></tr>'
-    f'<tr><td style="padding:3px 0;color:#888;">Last Period Change</td>'
-    f'<td style="padding:3px 0;text-align:right;font-weight:600;color:{score_chg_color};font-family:monospace;">{score_chg_str}</td></tr>'
+    f'<td style="padding-top:6px;">Normalized</td>'
+    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{interp_color};">{gold_score:+.2f}</td></tr>'
+    f'<tr><td>Last Period Change</td>'
+    f'<td class="summary-td-right" style="font-weight:600;color:{score_chg_color};">{score_chg_str}</td></tr>'
     '</table></div>'
-    # Interpretation scale
-    '<div style="flex:0 0 auto;min-width:220px;">'
-    '<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Interpretation Scale</div>'
-    '<table style="font-size:0.78rem;color:#aaa;border-collapse:collapse;">'
-    '<tr><td style="padding:2px 10px 2px 0;color:#ef4444;font-family:monospace;">-1.0 to -0.5</td><td>Strong Bearish</td></tr>'
-    '<tr><td style="padding:2px 10px 2px 0;color:#fca5a5;font-family:monospace;">-0.5 to -0.1</td><td>Bearish</td></tr>'
-    '<tr><td style="padding:2px 10px 2px 0;color:#facc15;font-family:monospace;">-0.1 to +0.1</td><td>Neutral</td></tr>'
-    '<tr><td style="padding:2px 10px 2px 0;color:#86efac;font-family:monospace;">+0.1 to +0.5</td><td>Bullish</td></tr>'
-    '<tr><td style="padding:2px 10px 2px 0;color:#22c55e;font-family:monospace;">+0.5 to +1.0</td><td>Strong Bullish</td></tr>'
-    '</table>'
-    f'<div style="margin-top:12px;font-size:0.75rem;color:#666;">'
-    f'{total_factors} factors &middot; {num_clusters} clusters &middot; {total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
     '</div>'
-    '</div>'
+)
+
+# ─── Price Predictions & Support/Resistance ──────────────────────────────────
+# Compute from gold price history using technical methods:
+#   Predictions: score-adjusted linear regression extrapolation
+#   Support/Resistance: pivot points from recent high/low/close
+_gc = historical_data.get("GC=F")
+_targets_html = ""
+if _gc is not None and len(_gc) > 200:
+    _spot = float(_gc.iloc[-1])
+
+    # --- Price Predictions ---
+    # Blended approach: combine long-term base rate with recent momentum,
+    # tilted by the Gold Score signal. Much more conservative than pure
+    # linear extrapolation.
+
+    # 1) Long-term base rate: gold's historical avg annual return ~7-8%
+    _LT_ANNUAL_RETURN = 0.075  # 7.5% annualized base rate
+    _lt_daily = _LT_ANNUAL_RETURN / 252
+
+    # 2) Recent momentum: 60-day regression slope as annualized return
+    _gc_60 = _gc.iloc[-60:].dropna()
+    _x = np.arange(len(_gc_60))
+    _slope, _intercept = np.polyfit(_x, _gc_60.values, 1)
+    _momentum_daily_return = _slope / _spot  # convert $/day to % return/day
+
+    # 3) Blend: short horizons lean more on momentum, long horizons
+    #    revert toward the long-term base rate (mean reversion)
+    _horizon_blend = {"1W": 0.8, "1M": 0.6, "6M": 0.3, "12M": 0.15}
+
+    # 4) Gold Score tilt: score adds/subtracts a fraction of volatility
+    #    to the expected return (not a multiplier). Score of ±1 → ±0.5σ tilt
+    _daily_returns = _gc.pct_change().dropna()
+    _daily_vol = float(_daily_returns.iloc[-60:].std())
+    _ann_vol = _daily_vol * np.sqrt(252)
+    _score_tilt_annual = gold_score * _ann_vol * 0.5  # ±half-sigma
+    _score_tilt_daily = _score_tilt_annual / 252
+
+    _predictions = {}
+    for _label, _days in [("1W", 5), ("1M", 21), ("6M", 126), ("12M", 252)]:
+        _w = _horizon_blend[_label]
+        # Blended daily return: weighted avg of momentum and long-term base
+        _blended_daily = _w * _momentum_daily_return + (1 - _w) * _lt_daily
+        # Add the score-based tilt
+        _blended_daily += _score_tilt_daily
+        # Compound the return over the horizon
+        _proj = _spot * (1 + _blended_daily) ** _days
+        # Bound by ±1σ of the horizon volatility (tighter than the old ±2σ)
+        _max_move = _spot * _ann_vol * (_days / 252) ** 0.5
+        _proj = max(min(_proj, _spot + _max_move), _spot - _max_move)
+        _pct = (_proj - _spot) / _spot * 100
+        _predictions[_label] = {"price": _proj, "pct": _pct}
+
+    # --- Support & Resistance (Pivot Points) ---
+    # Classic pivot: use prior day's High, Low, Close
+    try:
+        _gc_full = yf.download("GC=F", period="5d", interval="1d", progress=False)
+        if isinstance(_gc_full.columns, pd.MultiIndex):
+            _h = float(_gc_full[("High", "GC=F")].dropna().iloc[-2])
+            _l = float(_gc_full[("Low", "GC=F")].dropna().iloc[-2])
+            _c = float(_gc_full[("Close", "GC=F")].dropna().iloc[-2])
+        else:
+            _h = float(_gc_full["High"].dropna().iloc[-2])
+            _l = float(_gc_full["Low"].dropna().iloc[-2])
+            _c = float(_gc_full["Close"].dropna().iloc[-2])
+    except Exception:
+        _h, _l, _c = _spot * 1.005, _spot * 0.995, _spot
+
+    _pivot = (_h + _l + _c) / 3
+    _r1 = 2 * _pivot - _l
+    _r2 = _pivot + (_h - _l)
+    _r3 = _h + 2 * (_pivot - _l)
+    _s1 = 2 * _pivot - _h
+    _s2 = _pivot - (_h - _l)
+    _s3 = _l - 2 * (_h - _pivot)
+
+    # --- Build HTML ---
+    _targets_html = (
+        '<div class="targets-flex">'
+
+        # Price Predictions
+        '<div class="targets-col">'
+        '<div class="summary-label" style="margin-bottom:8px;">Price Projections</div>'
+        '<table class="summary-table">'
+        '<tr style="border-bottom:1px solid #333;">'
+        '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;">Horizon</th>'
+        '<th style="padding:3px 8px;text-align:right;color:#888;font-weight:600;">Target</th>'
+        '<th style="padding:3px 0;text-align:right;color:#888;font-weight:600;">Chg</th></tr>'
+    )
+    for _label in ["1W", "1M", "6M", "12M"]:
+        _p = _predictions[_label]
+        _pc = _p["pct"]
+        _clr = "#22c55e" if _pc > 0.1 else ("#ef4444" if _pc < -0.1 else "#facc15")
+        _arrow = "▲" if _pc > 0.1 else ("▼" if _pc < -0.1 else "—")
+        _targets_html += (
+            f'<tr style="border-bottom:1px solid #1a1a2e;">'
+            f'<td style="padding:4px 0;color:#aaa;">{_label}</td>'
+            f'<td style="padding:4px 8px;text-align:right;font-family:monospace;font-weight:600;">'
+            f'${_p["price"]:,.0f}</td>'
+            f'<td style="padding:4px 0;text-align:right;font-family:monospace;color:{_clr};">'
+            f'{_arrow} {_pc:+.1f}%</td></tr>'
+        )
+    _targets_html += (
+        '</table>'
+        f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
+        f'Based on 60-day trend blended with score tilt (vol: {_ann_vol*100:.0f}% ann.)</div>'
+        '</div>'
+
+        # Support & Resistance
+        '<div class="targets-col">'
+        '<div class="summary-label" style="margin-bottom:8px;">Daily Pivot Levels</div>'
+        '<table class="summary-table">'
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:3px 0;color:#ef4444;">R3</td>'
+        f'<td class="summary-td-right">${_r3:,.0f}</td></tr>'
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:3px 0;color:#ef4444;">R2</td>'
+        f'<td class="summary-td-right">${_r2:,.0f}</td></tr>'
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:3px 0;color:#fca5a5;">R1</td>'
+        f'<td class="summary-td-right">${_r1:,.0f}</td></tr>'
+        f'<tr style="border-bottom:1px solid #333;background:rgba(255,255,255,0.03);">'
+        f'<td style="padding:4px 0;color:#facc15;font-weight:600;">Pivot</td>'
+        f'<td class="summary-td-right" style="font-weight:600;color:#facc15;">'
+        f'${_pivot:,.0f}</td></tr>'
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:3px 0;color:#86efac;">S1</td>'
+        f'<td class="summary-td-right">${_s1:,.0f}</td></tr>'
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:3px 0;color:#22c55e;">S2</td>'
+        f'<td class="summary-td-right">${_s2:,.0f}</td></tr>'
+        f'<tr>'
+        f'<td style="padding:3px 0;color:#22c55e;">S3</td>'
+        f'<td class="summary-td-right">${_s3:,.0f}</td></tr>'
+        '</table>'
+        f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
+        f'Classic pivot points (H=${_h:,.0f} L=${_l:,.0f} C=${_c:,.0f})</div>'
+        '</div>'
+        '</div>'
+    )
+
+_summary_html += _targets_html + (
+    f'<div class="summary-footer">'
+    f'{total_factors} factors &middot; {num_clusters} clusters &middot; '
+    f'{total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
+) + (
     # Gauge bar
-    '<div style="margin-top:18px;">'
-    '<div style="position:relative;height:18px;background:linear-gradient(to right,'
-    '#ef4444 0%,#fca5a5 25%,#facc15 45%,#facc15 55%,#86efac 75%,#22c55e 100%);'
-    'border-radius:9px;overflow:visible;">'
-    f'<div style="position:absolute;left:{gauge_pct:.1f}%;top:-3px;'
-    'transform:translateX(-50%);width:4px;height:24px;'
-    'background:white;border-radius:2px;box-shadow:0 0 6px rgba(255,255,255,0.6);"></div>'
-    '<div style="position:absolute;left:50%;top:-1px;transform:translateX(-50%);'
-    'width:1px;height:20px;background:rgba(0,0,0,0.4);"></div>'
+    '<div class="gauge-wrap">'
+    '<div class="gauge-bar">'
+    f'<div class="gauge-needle" style="left:{gauge_pct:.1f}%;"></div>'
+    '<div class="gauge-center"></div>'
     '</div>'
-    '<div style="display:flex;justify-content:space-between;font-size:0.7rem;color:#666;margin-top:3px;">'
-    '<span>-1.0 Strong Bearish</span><span>0.0 Neutral</span><span>+1.0 Strong Bullish</span>'
+    '<div class="gauge-labels">'
+    '<span>-1.0 Bearish</span><span>Neutral</span><span>+1.0 Bullish</span>'
     '</div></div>'
     '</div>'
 )
@@ -1167,14 +1469,10 @@ for metal in spot_metals:
         chg_arrow = "—"
 
     _spot_rows += (
-        '<div style="flex:1;min-width:240px;background:#1a1a2e;border:1px solid #333;'
-        'border-radius:10px;padding:16px 20px;text-align:center;">'
-        f'<div style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:1px;">'
-        f'{metal["icon"]} {metal["name"]}</div>'
-        f'<div style="font-size:2rem;font-weight:700;color:#e0e0e0;'
-        f'font-family:\'SF Mono\',\'Fira Code\',monospace;margin:4px 0;">'
-        f'${current:,.2f}</div>'
-        f'<div style="font-size:0.9rem;color:{chg_color};font-weight:600;">'
+        '<div class="spot-card">'
+        f'<div class="summary-label">{metal["icon"]} {metal["name"]}</div>'
+        f'<div class="spot-price">${current:,.2f}</div>'
+        f'<div class="spot-change" style="color:{chg_color};">'
         f'{chg_arrow} ${abs(change):,.2f} ({change_pct:+.2f}%)</div>'
         f'<div style="margin-top:8px;display:flex;justify-content:center;">'
         f'<div style="display:inline-block;">'
@@ -1184,7 +1482,7 @@ for metal in spot_metals:
     )
 
 _spot_html = (
-    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px;">'
+    '<div class="spot-flex">'
     f'{_spot_rows}'
     '</div>'
 )
@@ -1231,8 +1529,9 @@ if gc_series is not None and len(rolling_scores) > 3:
         paper_bgcolor="#0f0f23",
         plot_bgcolor="#0e0e1a",
         font=dict(color="#d0d0d0"),
-        height=480,
-        margin=dict(l=55, r=55, t=30, b=40),
+        height=420,
+        autosize=True,
+        margin=dict(l=45, r=45, t=25, b=35),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="center", x=0.5, font=dict(size=11)),
         hovermode="x unified",
@@ -1253,7 +1552,7 @@ if gc_series is not None and len(rolling_scores) > 3:
                      tickfont=dict(color="#ccc"))
 
     chart_div_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False,
-                                  div_id="goldChart", config={"displayModeBar": False})
+                                  div_id="goldChart", config={"displayModeBar": False, "responsive": True})
 
     headlines_json = json.dumps([
         {"date": h["date"],
@@ -1268,9 +1567,17 @@ if gc_series is not None and len(rolling_scores) > 3:
 <!DOCTYPE html>
 <html>
 <head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="color-scheme" content="dark">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { background: #0f0f23; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  html, body {
+    background: #0f0f23;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+    overflow-x: hidden;
+  }
 
   .layout {
     display: flex;
@@ -1289,6 +1596,7 @@ if gc_series is not None and len(rolling_scores) > 3:
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+    -webkit-overflow-scrolling: touch;
   }
   .news-panel::-webkit-scrollbar { width: 5px; }
   .news-panel::-webkit-scrollbar-track { background: #1a1a2e; border-radius: 5px; }
@@ -1307,11 +1615,12 @@ if gc_series is not None and len(rolling_scores) > 3:
     color: #facc15;
     border: 1px solid #555;
     border-radius: 6px;
-    padding: 2px 9px;
-    font-size: 0.68rem;
+    padding: 4px 12px;
+    font-size: 0.72rem;
     cursor: pointer;
     display: none;
     transition: background 0.15s;
+    -webkit-tap-highlight-color: transparent;
   }
   .clear-btn:hover { background: #3a3a4a; }
   .date-label {
@@ -1328,7 +1637,7 @@ if gc_series is not None and len(rolling_scores) > 3:
     padding: 6px 0;
     flex-shrink: 0;
   }
-  .news-list { flex: 1; overflow-y: auto; }
+  .news-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 
   .day-header {
     font-size: 0.76rem;
@@ -1340,24 +1649,26 @@ if gc_series is not None and len(rolling_scores) > 3:
     padding-bottom: 3px;
   }
   .headline-item {
-    font-size: 0.72rem;
+    font-size: 0.76rem;
     color: #d0d0d0;
-    margin: 3px 0;
-    line-height: 1.4;
+    margin: 4px 0;
+    line-height: 1.45;
+    padding: 2px 0;
   }
   .headline-item a {
     color: #d0d0d0;
     text-decoration: none;
     transition: color 0.15s;
+    -webkit-tap-highlight-color: rgba(96,165,250,0.2);
   }
-  .headline-item a:hover { color: #60a5fa; }
+  .headline-item a:hover, .headline-item a:active { color: #60a5fa; }
   .headline-src { color: #666; }
   .headline-upcoming {
     color: #fbbf24;
     font-style: italic;
   }
   .headline-upcoming::before {
-    content: "📅 ";
+    content: "\\01F4C5 ";
   }
   .upcoming-tag {
     font-size: 0.55rem;
@@ -1385,10 +1696,30 @@ if gc_series is not None and len(rolling_scores) > 3:
   }
   .chart-panel .js-plotly-plot { cursor: crosshair !important; }
 
-  /* Responsive: stack on narrow screens */
-  @media (max-width: 800px) {
-    .layout { flex-direction: column-reverse; }
-    .news-panel { flex: none; max-height: 320px; }
+  /* ── Mobile: stack vertically ── */
+  @media (max-width: 768px) {
+    .layout {
+      flex-direction: column;
+      gap: 10px;
+    }
+    .chart-panel {
+      width: 100%;
+      order: 1;
+    }
+    .news-panel {
+      flex: none;
+      width: 100%;
+      min-width: unset;
+      max-height: 300px;
+      order: 2;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .news-title { font-size: 0.82rem; }
+    .headline-item { font-size: 0.74rem; }
+    .hint { font-size: 0.68rem; }
+    /* Make plotly chart touch-friendly */
+    .chart-panel .js-plotly-plot { cursor: default !important; }
   }
 </style>
 </head>
@@ -1562,21 +1893,182 @@ renderHeadlines(null);
 </html>
 """
 
-    components.html(interactive_html, height=580, scrolling=False)
+    components.html(interactive_html, height=760, scrolling=True)
 
 else:
     st.info("Insufficient data to render dual-axis chart.")
 
 st.divider()
 
-# ─── CSS for hover tooltips ──────────────────────────────────────────────────
+# ─── Comprehensive CSS: Summary + Factor Tables + Mobile ──────────────────────
 st.markdown("""
 <style>
+/* ══════════════════════════════════════════════════════════════════════════════
+   SUMMARY PANEL
+   ══════════════════════════════════════════════════════════════════════════════ */
+.summary-panel {
+    background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 100%);
+    border: 1px solid #333;
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-bottom: 20px;
+    overflow: hidden;
+}
+.summary-flex {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+.summary-score-block {
+    flex: 0 0 auto;
+    text-align: center;
+    min-width: 160px;
+}
+.summary-score-value {
+    font-size: 3rem;
+    font-weight: 800;
+    line-height: 1.1;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.summary-interp {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 4px;
+}
+.summary-chg {
+    font-size: 0.88rem;
+    font-weight: 600;
+    margin-top: 6px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.summary-breakdown {
+    flex: 1 1 240px;
+    min-width: 200px;
+}
+.summary-label {
+    font-size: 0.75rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.summary-table {
+    font-size: 0.82rem;
+    color: #d0d0d0;
+    border-collapse: collapse;
+    width: 100%;
+}
+.summary-table td {
+    padding: 3px 0;
+    color: #888;
+}
+.summary-td-right {
+    text-align: right;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    padding: 3px 0;
+}
+.summary-footer {
+    margin-top: 10px;
+    font-size: 0.65rem;
+    color: #555;
+    border-top: 1px solid #333;
+    padding-top: 6px;
+}
+
+/* Targets (Predictions + Pivot) */
+.targets-flex {
+    margin-top: 16px;
+    border-top: 1px solid #333;
+    padding-top: 14px;
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+}
+.targets-col {
+    flex: 1 1 180px;
+    min-width: 150px;
+}
+
+/* Gauge */
+.gauge-wrap { margin-top: 18px; }
+.gauge-bar {
+    position: relative;
+    height: 18px;
+    background: linear-gradient(to right,
+        #ef4444 0%, #fca5a5 25%, #facc15 45%, #facc15 55%, #86efac 75%, #22c55e 100%);
+    border-radius: 9px;
+    overflow: visible;
+}
+.gauge-needle {
+    position: absolute;
+    top: -3px;
+    transform: translateX(-50%);
+    width: 4px;
+    height: 24px;
+    background: white;
+    border-radius: 2px;
+    box-shadow: 0 0 6px rgba(255,255,255,0.6);
+}
+.gauge-center {
+    position: absolute;
+    left: 50%;
+    top: -1px;
+    transform: translateX(-50%);
+    width: 1px;
+    height: 20px;
+    background: rgba(0,0,0,0.4);
+}
+.gauge-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: #666;
+    margin-top: 3px;
+}
+
+/* Spot Metal Cards */
+.spot-flex {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}
+.spot-card {
+    flex: 1 1 200px;
+    min-width: 150px;
+    background: #1a1a2e;
+    border: 1px solid #333;
+    border-radius: 10px;
+    padding: 16px 16px;
+    text-align: center;
+}
+.spot-price {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    margin: 4px 0;
+}
+.spot-change {
+    font-size: 0.88rem;
+    font-weight: 600;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   FACTOR TABLES
+   ══════════════════════════════════════════════════════════════════════════════ */
+.factor-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin-bottom: 1.5rem;
+}
 .factor-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
-    margin-bottom: 1.5rem;
+    min-width: 700px;
 }
 .factor-table th {
     background: #1a1a2e;
@@ -1587,6 +2079,7 @@ st.markdown("""
     border-bottom: 2px solid #333;
     position: sticky;
     top: 0;
+    white-space: nowrap;
 }
 .factor-table td {
     padding: 6px 10px;
@@ -1615,8 +2108,8 @@ st.markdown("""
     z-index: 1000;
     left: 0;
     top: 100%;
-    width: 380px;
-    max-width: 90vw;
+    width: 340px;
+    max-width: 85vw;
     background: #1a1a2e;
     border: 1px solid #444;
     border-radius: 8px;
@@ -1654,12 +2147,133 @@ st.markdown("""
 .score-neg { color: #ef4444; font-weight: 600; }
 .score-zero { color: #888; }
 .val-cell { font-weight: 600; font-family: 'SF Mono', 'Fira Code', monospace; }
+.val-unit { font-size: 0.6rem; color: #666; font-weight: 400; font-family: -apple-system, sans-serif; margin-top: 1px; }
 .chg-cell { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
 .chg-green { color: #22c55e; }
 .chg-red { color: #ef4444; }
 .chg-gray { color: #888; }
-.spark-cell { padding: 4px 6px !important; vertical-align: middle; min-width: 130px; }
+.spark-cell { padding: 4px 6px !important; vertical-align: middle; min-width: 120px; }
 .spark-cell svg { display: block; }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   MOBILE BREAKPOINTS
+   ══════════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+    /* Summary panel */
+    .summary-panel {
+        padding: 16px 14px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+    }
+    .summary-flex {
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+    }
+    .summary-score-block {
+        min-width: unset;
+        width: 100%;
+    }
+    .summary-score-value {
+        font-size: 2.6rem;
+    }
+    .summary-interp {
+        font-size: 0.92rem;
+    }
+    .summary-chg {
+        font-size: 0.82rem;
+    }
+    .summary-breakdown {
+        min-width: unset;
+        width: 100%;
+    }
+    .summary-table {
+        font-size: 0.78rem;
+    }
+
+    /* Targets (predictions + pivots) */
+    .targets-flex {
+        flex-direction: column;
+        gap: 14px;
+        padding-top: 10px;
+    }
+    .targets-col {
+        min-width: unset;
+        width: 100%;
+    }
+
+    /* Gauge */
+    .gauge-labels {
+        font-size: 0.62rem;
+    }
+
+    /* Spot cards */
+    .spot-flex {
+        gap: 10px;
+    }
+    .spot-card {
+        min-width: calc(50% - 8px);
+        flex: 1 1 calc(50% - 8px);
+        padding: 12px 10px;
+        border-radius: 8px;
+    }
+    .spot-price {
+        font-size: 1.3rem;
+    }
+    .spot-change {
+        font-size: 0.78rem;
+    }
+
+    /* Factor tables — horizontally scrollable */
+    .factor-table-wrap {
+        margin-left: -0.5rem;
+        margin-right: -0.5rem;
+        padding: 0 0.5rem;
+    }
+    .factor-table {
+        font-size: 0.75rem;
+    }
+    .factor-table th {
+        padding: 6px 6px;
+        font-size: 0.72rem;
+    }
+    .factor-table td {
+        padding: 5px 6px;
+    }
+    .val-cell {
+        font-size: 0.78rem;
+    }
+    .chg-cell {
+        font-size: 0.72rem;
+    }
+    .spark-cell {
+        min-width: 90px;
+    }
+
+    /* Tooltips on mobile: wider for readability */
+    .ind-cell .tooltip-box {
+        width: 280px;
+        left: -10px;
+        font-size: 0.76rem;
+    }
+}
+
+/* Extra-small phones (iPhone SE etc.) */
+@media (max-width: 400px) {
+    .summary-score-value {
+        font-size: 2.2rem;
+    }
+    .spot-card {
+        min-width: 100%;
+        flex: 1 1 100%;
+    }
+    .spot-price {
+        font-size: 1.2rem;
+    }
+    .gauge-labels span:nth-child(2) {
+        display: none;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1676,7 +2290,7 @@ def render_category_table(cat_df):
         "Change": "Chg"
     }
 
-    html = '<table class="factor-table">'
+    html = '<div class="factor-table-wrap"><table class="factor-table">'
     html += '<tr>'
     for c in cols:
         label = header_labels.get(c, c)
@@ -1732,14 +2346,31 @@ def render_category_table(cat_df):
                 html += f'<td class="{css}">{fval:+.1f}</td>'
 
             elif c == "Value":
-                html += f'<td class="val-cell">{esc(str(val))}</td>'
+                unit_raw = row.get("Unit", "")
+                # Build a short descriptor tag from the unit
+                unit_descriptors = {
+                    "%": "rate %", "% GDP": "% of GDP", "% ann.": "annualized %",
+                    "pp": "percentage pts", "$B": "USD billions", "$B/yr": "USD B / year",
+                    "$T": "USD trillions", "$M/pt": "USD M / point", "$M/mo": "USD M / month",
+                    "$/oz": "USD per troy oz", "pts": "index points", "vol pts": "volatility pts",
+                    "bps": "basis points", "x": "ratio multiple", "ratio": "price ratio",
+                    "contracts": "net contracts", "M oz": "million troy oz", "oz": "troy ounces",
+                    "tonnes": "metric tonnes", "tonnes/yr": "tonnes / year",
+                    "bbl/oz": "barrels per oz", "/2": "of 2 MAs", "0-100": "scale 0–100",
+                    "index": "index value",
+                }
+                desc = unit_descriptors.get(unit_raw, unit_raw)
+                html += f'<td class="val-cell">{esc(str(val))}'
+                if desc:
+                    html += f'<div class="val-unit">{esc(desc)}</div>'
+                html += '</td>'
 
             else:
                 html += f'<td>{esc(str(val))}</td>'
 
         html += '</tr>'
 
-    html += '</table>'
+    html += '</table></div>'
     return html
 
 
