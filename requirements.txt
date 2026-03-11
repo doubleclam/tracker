@@ -9,3 +9,4 @@ rich
 pytrends
 plotly
 xlrd
+openpyxl
