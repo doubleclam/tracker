@@ -97,43 +97,13 @@ st.markdown("""
 
 def fetch_analyst_forecasts():
     """Return list of analyst gold price forecasts for the current survey year.
-    Each entry: {analyst, institution, low, avg, high}.
-    Tries live LBMA scrape first; falls back to hardcoded 2026 survey."""
+    Each entry: {analyst, institution, low, avg, high, date, source}.
+    Combines LBMA survey (28 analysts, Jan 2026) with major Wall Street bank
+    forecasts (updated Feb/Mar 2026). Sorted by avg ascending."""
 
-    # ── Try live scrape ──────────────────────────────────────────────────
-    try:
-        from bs4 import BeautifulSoup
-        resp = requests.get(
-            "https://www.lbma.org.uk/forecast-survey-2026/analysts-forecasts",
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; GoldDashboard/1.0)"},
-        )
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = []
-            # LBMA page lists analysts in cards / table rows — parse whatever structure exists
-            for card in soup.select("table tr, .analyst-card, .forecast-row"):
-                cells = card.find_all(["td", "span", "div"])
-                texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
-                if len(texts) >= 5:
-                    # Try to extract: analyst, institution, low, avg, high
-                    try:
-                        name = texts[0]
-                        inst = texts[1]
-                        low = float(texts[2].replace(",", "").replace("$", ""))
-                        avg = float(texts[3].replace(",", "").replace("$", ""))
-                        high = float(texts[4].replace(",", "").replace("$", ""))
-                        if 1000 < avg < 20000:  # sanity check
-                            rows.append({"analyst": name, "institution": inst, "low": low, "avg": avg, "high": high})
-                    except (ValueError, IndexError):
-                        continue
-            if len(rows) >= 10:
-                return sorted(rows, key=lambda r: r["avg"]), 2026
-    except Exception:
-        pass
-
-    # ── Fallback: hardcoded LBMA 2026 Forecast Survey (published Jan 2026) ──
-    data = [
+    # ── LBMA 2026 Forecast Survey (published Jan 20, 2026) ───────────────
+    # 28 named analysts — annual calendar-year average price forecasts.
+    lbma = [
         {"analyst": "Robin Bhar",           "institution": "Robin Bhar Metals Consulting", "low": 3500, "avg": 4000, "high": 5000},
         {"analyst": "Bart Melek",           "institution": "TD Securities",               "low": 3920, "avg": 4213, "high": 4775},
         {"analyst": "Bernard Dahdah",       "institution": "Natixis",                     "low": 3700, "avg": 4250, "high": 4950},
@@ -163,6 +133,27 @@ def fetch_analyst_forecasts():
         {"analyst": "Rene Hochreiter",      "institution": "NOAH Capital Markets",        "low": 4352, "avg": 5750, "high": 6300},
         {"analyst": "Julia Du",             "institution": "ICBC Standard Bank",          "low": 4100, "avg": 6050, "high": 7150},
     ]
+    for r in lbma:
+        r["date"] = "Jan 2026"
+        r["source"] = "LBMA"
+
+    # ── Major Wall Street / Bank Forecasts (revised post-LBMA) ───────────
+    # Year-end or 12-month targets; low/high from stated ranges or analyst
+    # upside/downside scenarios.
+    banks = [
+        {"analyst": "Kenny Hu",              "institution": "Citi",              "low": 4500, "avg": 5000, "high": 5500,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Lina Thomas",           "institution": "Goldman Sachs",     "low": 4600, "avg": 5400, "high": 6000,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Commodities Desk",      "institution": "Morgan Stanley",    "low": 4800, "avg": 5700, "high": 6200,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Daniel Hynes",          "institution": "ANZ",               "low": 5000, "avg": 5800, "high": 6200,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Michael Widmer",        "institution": "Bank of America",   "low": 5000, "avg": 6000, "high": 6500,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Commodities Desk",      "institution": "BNP Paribas",       "low": 5000, "avg": 6000, "high": 6500,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Michael Hsueh",         "institution": "Deutsche Bank (Rev)", "low": 5000, "avg": 6000, "high": 6500, "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Joni Teves",            "institution": "UBS (Revised)",     "low": 4600, "avg": 6200, "high": 7200,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Investment Institute",  "institution": "Wells Fargo",       "low": 6100, "avg": 6200, "high": 6300,  "date": "Feb 2026", "source": "Bank"},
+        {"analyst": "Gregory Shearer",       "institution": "J.P. Morgan",       "low": 5000, "avg": 6300, "high": 8500,  "date": "Feb 2026", "source": "Bank"},
+    ]
+
+    data = lbma + banks
     return sorted(data, key=lambda r: r["avg"]), 2026
 
 # ─── Factor Configuration (loaded from spreadsheet) ──────────────────────────
@@ -1412,7 +1403,7 @@ if _gc is not None and len(_gc) > 200:
         # Analyst Consensus
         '<div class="targets-col">'
         f'<div class="summary-label" style="margin-bottom:8px;">'
-        f'{_forecast_year} Analyst Consensus ({_n_analysts} Analysts)</div>'
+        f'{_forecast_year} Gold Forecasts ({_n_analysts} Analysts)</div>'
         '<table class="summary-table">'
         '<tr style="border-bottom:1px solid #333;">'
         '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;"></th>'
@@ -1449,7 +1440,7 @@ if _gc is not None and len(_gc) > 200:
         '</table>'
         f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
         f'{_above_spot} of {_n_analysts} forecast above spot (${_spot:,.0f}) '
-        f'&middot; Source: LBMA Forecast Survey {_forecast_year}</div>'
+        f'&middot; LBMA Survey (Jan) + Wall St Banks (Feb/Mar)</div>'
         '</div>'
 
         # Support & Resistance
@@ -1521,11 +1512,13 @@ if fetch_errors:
 # ─── Analyst Forecasts Detail Expander ─────────────────────────────────────
 if _analyst_forecasts and _gc is not None and len(_gc) > 200:
     _spot_for_table = float(_gc.iloc[-1])
-    with st.expander(f"View All {len(_analyst_forecasts)} Analyst Forecasts — LBMA {_forecast_year} Survey", expanded=False):
+    _n_lbma = sum(1 for a in _analyst_forecasts if a.get("source") == "LBMA")
+    _n_bank = sum(1 for a in _analyst_forecasts if a.get("source") == "Bank")
+    with st.expander(f"View All {len(_analyst_forecasts)} Analyst Forecasts — {_n_lbma} LBMA + {_n_bank} Wall Street", expanded=False):
         # Build HTML table of all analysts
         _at_html = (
             '<div class="factor-table-wrap">'
-            '<table class="factor-table" style="min-width:500px;">'
+            '<table class="factor-table" style="min-width:620px;">'
             '<tr>'
             '<th style="padding:6px 8px;">Analyst</th>'
             '<th style="padding:6px 8px;">Institution</th>'
@@ -1533,6 +1526,8 @@ if _analyst_forecasts and _gc is not None and len(_gc) > 200:
             '<th style="padding:6px 8px;text-align:right;">Average</th>'
             '<th style="padding:6px 8px;text-align:right;">High</th>'
             '<th style="padding:6px 8px;text-align:right;">vs Spot</th>'
+            '<th style="padding:6px 8px;text-align:center;">Date</th>'
+            '<th style="padding:6px 8px;text-align:center;">Source</th>'
             '</tr>'
         )
         _above_count = 0
@@ -1545,6 +1540,13 @@ if _analyst_forecasts and _gc is not None and len(_gc) > 200:
             _row_bg = "background:rgba(96,165,250,0.06);" if _in_range else ""
             if _af["avg"] > _spot_for_table:
                 _above_count += 1
+            # Source badge color
+            _src = _af.get("source", "LBMA")
+            if _src == "Bank":
+                _src_badge = '<span style="font-size:0.65rem;background:rgba(96,165,250,0.15);color:#60a5fa;padding:1px 6px;border-radius:3px;">Bank</span>'
+            else:
+                _src_badge = '<span style="font-size:0.65rem;background:rgba(250,204,21,0.15);color:#facc15;padding:1px 6px;border-radius:3px;">LBMA</span>'
+            _af_date = _af.get("date", "Jan 2026")
             _at_html += (
                 f'<tr style="{_row_bg}">'
                 f'<td style="padding:5px 8px;font-weight:500;color:#d0d0d0;">{_af["analyst"]}</td>'
@@ -1554,6 +1556,8 @@ if _analyst_forecasts and _gc is not None and len(_gc) > 200:
                 f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:#22c55e;">${_af["high"]:,.0f}</td>'
                 f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:{_vs_clr};">'
                 f'{_vs_arrow} {_vs:+.1f}%</td>'
+                f'<td style="padding:5px 8px;text-align:center;font-size:0.75rem;color:#888;">{_af_date}</td>'
+                f'<td style="padding:5px 8px;text-align:center;">{_src_badge}</td>'
                 '</tr>'
             )
         _at_html += (
@@ -1564,7 +1568,8 @@ if _analyst_forecasts and _gc is not None and len(_gc) > 200:
             f'Rows highlighted in blue indicate spot price falls within the analyst\'s low-high range.'
             f'</div>'
             f'<div style="margin-top:6px;font-size:0.65rem;color:#555;">'
-            f'Source: LBMA Annual Precious Metals Forecast Survey {_forecast_year}. '
+            f'<span style="color:#facc15;">LBMA</span> = LBMA Annual Forecast Survey (published Jan 20, {_forecast_year}) &middot; '
+            f'<span style="color:#60a5fa;">Bank</span> = Wall Street research notes (Feb/Mar {_forecast_year}). '
             f'Sorted by average forecast ascending.</div>'
         )
         st.markdown(_at_html, unsafe_allow_html=True)
@@ -1633,12 +1638,13 @@ if gc_series is not None and len(rolling_scores) > 3:
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
+    # Suppress Plotly's own hover tooltip — we render our own header
     fig.add_trace(
         go.Scatter(
             x=gc_chart.index, y=gc_chart.values,
-            name="Gold Price ($/oz)", mode="lines",
+            name="Gold Price", mode="lines",
             line=dict(color="#FFD700", width=2),
-            hovertemplate="<b>Gold Price</b><br>%{x|%b %d, %Y}<br>$%{y:,.0f}<extra></extra>",
+            hoverinfo="skip",
         ),
         secondary_y=False,
     )
@@ -1647,42 +1653,75 @@ if gc_series is not None and len(rolling_scores) > 3:
             x=rolling_scores.index, y=rolling_scores.values,
             name="Gold Score", mode="lines",
             line=dict(color="#60a5fa", width=2, dash="dot"),
-            hovertemplate="<b>Gold Score</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+            hoverinfo="skip",
         ),
         secondary_y=True,
     )
     fig.add_hline(y=0, secondary_y=True, line_dash="dash",
                   line_color="rgba(255,255,255,0.15)", line_width=1)
 
+    # Hover-dot traces: invisible until JS moves them to the hovered point
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None],
+            name="_gold_dot", mode="markers",
+            marker=dict(color="#FFD700", size=12,
+                        line=dict(color="white", width=2)),
+            hoverinfo="skip", showlegend=False,
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None],
+            name="_score_dot", mode="markers",
+            marker=dict(color="#60a5fa", size=12,
+                        line=dict(color="white", width=2)),
+            hoverinfo="skip", showlegend=False,
+        ),
+        secondary_y=True,
+    )
+
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#0f0f23",
         plot_bgcolor="#0e0e1a",
         font=dict(color="#d0d0d0"),
-        height=420,
+        height=380,
         autosize=True,
-        margin=dict(l=45, r=45, t=25, b=35),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="center", x=0.5, font=dict(size=11)),
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor="rgba(15,15,35,0.9)", font_size=12, font_color="#d0d0d0"),
+        margin=dict(l=50, r=50, t=8, b=35),
+        legend=dict(visible=False),
+        hovermode="x",
+        hoverlabel=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)",
+                        font_size=1, font_color="rgba(0,0,0,0)"),
+        spikedistance=-1,
     )
     fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", showgrid=True,
                      tickfont=dict(color="#aaa"),
                      showspikes=True, spikemode="across", spikesnap="cursor",
-                     spikethickness=1, spikecolor="rgba(255,255,255,0.3)",
+                     spikethickness=1, spikecolor="rgba(255,255,255,0.25)",
                      spikedash="dot")
     fig.update_yaxes(title_text="Gold $/oz", gridcolor="rgba(255,255,255,0.05)",
                      showgrid=True, secondary_y=False, tickformat="$,.0f",
                      title_font=dict(color="#FFD700", size=11),
-                     tickfont=dict(color="#ccc"))
+                     tickfont=dict(color="#ccc"),
+                     showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikecolor="rgba(255,215,0,0.2)",
+                     spikedash="dot")
     fig.update_yaxes(title_text="Score", secondary_y=True, range=[-1.05, 1.05],
                      tickformat="+.2f", title_font=dict(color="#60a5fa", size=11),
                      gridcolor="rgba(255,255,255,0.03)",
-                     tickfont=dict(color="#ccc"))
+                     tickfont=dict(color="#ccc"),
+                     showspikes=False)
 
     chart_div_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False,
                                   div_id="goldChart", config={"displayModeBar": False, "responsive": True})
+
+    # Pass the last known price/score to JS for the default header display
+    _last_price = float(gc_chart.iloc[-1]) if len(gc_chart) > 0 else 0
+    _last_score = float(rolling_scores.iloc[-1]) if len(rolling_scores) > 0 else 0
+    _prev_price = float(gc_chart.iloc[-2]) if len(gc_chart) > 1 else _last_price
+    _last_date = str(gc_chart.index[-1].date()) if len(gc_chart) > 0 else ""
 
     headlines_json = json.dumps([
         {"date": h["date"],
@@ -1716,13 +1755,13 @@ if gc_series is not None and len(rolling_scores) > 3:
   }
   /* Left: headlines panel */
   .news-panel {
-    flex: 0 0 300px;
-    min-width: 280px;
+    flex: 0 0 280px;
+    min-width: 260px;
     background: #12121f;
     border: 1px solid #333;
     border-radius: 10px;
     padding: 14px 16px;
-    max-height: 540px;
+    max-height: 560px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -1731,125 +1770,94 @@ if gc_series is not None and len(rolling_scores) > 3:
   .news-panel::-webkit-scrollbar { width: 5px; }
   .news-panel::-webkit-scrollbar-track { background: #1a1a2e; border-radius: 5px; }
   .news-panel::-webkit-scrollbar-thumb { background: #444; border-radius: 5px; }
-
-  .news-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
-    flex-shrink: 0;
-  }
+  .news-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-shrink:0; }
   .news-title { font-size: 0.88rem; font-weight: 700; color: #e0e0e0; }
-  .clear-btn {
-    background: #2a2a3a;
-    color: #facc15;
-    border: 1px solid #555;
-    border-radius: 6px;
-    padding: 4px 12px;
-    font-size: 0.72rem;
-    cursor: pointer;
-    display: none;
-    transition: background 0.15s;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .clear-btn:hover { background: #3a3a4a; }
-  .date-label {
-    font-size: 0.76rem;
-    color: #facc15;
-    margin-bottom: 8px;
-    display: none;
-    flex-shrink: 0;
-  }
-  .hint {
-    text-align: center;
-    font-size: 0.7rem;
-    color: #666;
-    padding: 6px 0;
-    flex-shrink: 0;
-  }
-  .news-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .clear-btn { background:#2a2a3a; color:#facc15; border:1px solid #555; border-radius:6px; padding:4px 12px; font-size:0.72rem; cursor:pointer; display:none; -webkit-tap-highlight-color:transparent; }
+  .clear-btn:hover { background:#3a3a4a; }
+  .date-label { font-size:0.76rem; color:#facc15; margin-bottom:8px; display:none; flex-shrink:0; }
+  .hint { text-align:center; font-size:0.7rem; color:#666; padding:6px 0; flex-shrink:0; }
+  .news-list { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  .day-header { font-size:0.76rem; font-weight:700; color:#60a5fa; margin-top:10px; margin-bottom:4px; border-bottom:1px solid #2a2a3a; padding-bottom:3px; }
+  .headline-item { font-size:0.76rem; color:#d0d0d0; margin:4px 0; line-height:1.45; padding:2px 0; }
+  .headline-item a { color:#d0d0d0; text-decoration:none; -webkit-tap-highlight-color:rgba(96,165,250,0.2); }
+  .headline-item a:hover, .headline-item a:active { color:#60a5fa; }
+  .headline-src { color:#666; }
+  .headline-upcoming { color:#fbbf24; font-style:italic; }
+  .headline-upcoming::before { content:"\\01F4C5 "; }
+  .upcoming-tag { font-size:0.55rem; background:rgba(251,191,36,0.15); color:#fbbf24; padding:1px 5px; border-radius:3px; margin-left:4px; vertical-align:middle; }
+  .news-footer { font-size:0.58rem; color:#444; margin-top:10px; border-top:1px solid #2a2a3a; padding-top:5px; flex-shrink:0; }
 
-  .day-header {
-    font-size: 0.76rem;
+  /* Right: chart wrapper */
+  .chart-panel { flex:1; min-width:0; position:relative; }
+
+  /* ── Yahoo Finance-style header bar ── */
+  .chart-header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 6px 4px 8px 4px;
+    min-height: 38px;
+  }
+  .ch-price {
+    font-size: 1.5rem;
     font-weight: 700;
+    color: #FFD700;
+    font-family: 'SF Mono','Fira Code',monospace;
+  }
+  .ch-change {
+    font-size: 0.88rem;
+    font-weight: 600;
+    font-family: 'SF Mono','Fira Code',monospace;
+  }
+  .ch-score {
+    font-size: 0.88rem;
+    font-weight: 600;
     color: #60a5fa;
-    margin-top: 10px;
-    margin-bottom: 4px;
-    border-bottom: 1px solid #2a2a3a;
-    padding-bottom: 3px;
+    font-family: 'SF Mono','Fira Code',monospace;
   }
-  .headline-item {
-    font-size: 0.76rem;
-    color: #d0d0d0;
-    margin: 4px 0;
-    line-height: 1.45;
-    padding: 2px 0;
-  }
-  .headline-item a {
-    color: #d0d0d0;
-    text-decoration: none;
-    transition: color 0.15s;
-    -webkit-tap-highlight-color: rgba(96,165,250,0.2);
-  }
-  .headline-item a:hover, .headline-item a:active { color: #60a5fa; }
-  .headline-src { color: #666; }
-  .headline-upcoming {
-    color: #fbbf24;
-    font-style: italic;
-  }
-  .headline-upcoming::before {
-    content: "\\01F4C5 ";
-  }
-  .upcoming-tag {
-    font-size: 0.55rem;
-    background: rgba(251,191,36,0.15);
-    color: #fbbf24;
-    padding: 1px 5px;
-    border-radius: 3px;
-    margin-left: 4px;
-    vertical-align: middle;
-  }
-  .news-footer {
-    font-size: 0.58rem;
-    color: #444;
-    margin-top: 10px;
-    border-top: 1px solid #2a2a3a;
-    padding-top: 5px;
-    flex-shrink: 0;
+  .ch-date {
+    font-size: 0.75rem;
+    color: #888;
+    margin-left: auto;
   }
 
-  /* Right: chart */
-  .chart-panel {
-    flex: 1;
-    min-width: 0;
-    position: relative;
+  /* ── Time period selector ── */
+  .period-bar {
+    display: flex;
+    gap: 4px;
+    padding: 0 4px 6px 4px;
   }
+  .period-btn {
+    background: #1a1a2e;
+    color: #888;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: all 0.15s;
+  }
+  .period-btn:hover { color:#d0d0d0; border-color:#555; }
+  .period-btn.active { background:#60a5fa; color:#0f0f23; border-color:#60a5fa; }
+
+  /* ── Chart crosshair cursor ── */
   .chart-panel .js-plotly-plot { cursor: crosshair !important; }
 
-  /* ── Mobile: stack vertically ── */
+  /* ── Mobile ── */
   @media (max-width: 768px) {
-    .layout {
-      flex-direction: column;
-      gap: 10px;
-    }
-    .chart-panel {
-      width: 100%;
-      order: 1;
-    }
-    .news-panel {
-      flex: none;
-      width: 100%;
-      min-width: unset;
-      max-height: 300px;
-      order: 2;
-      border-radius: 8px;
-      padding: 10px 12px;
-    }
-    .news-title { font-size: 0.82rem; }
-    .headline-item { font-size: 0.74rem; }
-    .hint { font-size: 0.68rem; }
-    /* Make plotly chart touch-friendly */
-    .chart-panel .js-plotly-plot { cursor: default !important; }
+    .layout { flex-direction:column; gap:10px; }
+    .chart-panel { width:100%; order:1; }
+    .news-panel { flex:none; width:100%; min-width:unset; max-height:300px; order:2; border-radius:8px; padding:10px 12px; }
+    .news-title { font-size:0.82rem; }
+    .headline-item { font-size:0.74rem; }
+    .ch-price { font-size:1.25rem; }
+    .ch-change, .ch-score { font-size:0.78rem; }
+    .ch-date { font-size:0.68rem; }
+    .period-btn { padding:3px 8px; font-size:0.68rem; }
+    .chart-panel .js-plotly-plot { cursor:default !important; }
   }
 </style>
 </head>
@@ -1868,24 +1876,43 @@ if gc_series is not None and len(rolling_scores) > 3:
   </div>
   <!-- RIGHT: Chart -->
   <div class="chart-panel">
+    <!-- Yahoo Finance-style header: updates on hover -->
+    <div class="chart-header" id="chartHeader">
+      <span class="ch-price" id="chPrice">$""" + f"{_last_price:,.2f}" + """</span>
+      <span class="ch-change" id="chChange"></span>
+      <span class="ch-score" id="chScore">Score """ + f"{_last_score:+.3f}" + """</span>
+      <span class="ch-date" id="chDate">""" + _last_date + """</span>
+    </div>
+    <!-- Period selector -->
+    <div class="period-bar" id="periodBar">
+      <button class="period-btn" data-months="1">1M</button>
+      <button class="period-btn" data-months="3">3M</button>
+      <button class="period-btn" data-months="6">6M</button>
+      <button class="period-btn active" data-months="12">1Y</button>
+      <button class="period-btn" data-months="60">5Y</button>
+      <button class="period-btn" data-months="0">Max</button>
+    </div>
     """ + chart_div_html + """
   </div>
 </div>
 
 <script>
 var ALL_HEADLINES = """ + headlines_json + """;
+var DEFAULT_PRICE = """ + f"{_last_price:.2f}" + """;
+var DEFAULT_SCORE = """ + f"{_last_score:.4f}" + """;
+var PREV_PRICE = """ + f"{_prev_price:.2f}" + """;
+var DEFAULT_DATE = '""" + _last_date + """';
 
+/* ── Headline rendering (unchanged logic) ── */
 function renderHeadlines(clickedDate) {
     var list = document.getElementById("newsList");
     var lbl  = document.getElementById("dateLabel");
     var btn  = document.getElementById("clearBtn");
     var hint = document.getElementById("hintText");
     if (!list) return;
-
     var filtered;
     if (clickedDate) {
         var fd = clickedDate.split("T")[0];
-        // Show headlines on the clicked day and PRIOR
         filtered = ALL_HEADLINES.filter(function(h){ return h.date <= fd; });
         lbl.innerHTML = "&#x1F4CC; Headlines up to <b>" + fd + "</b>";
         lbl.style.display = "block";
@@ -1897,109 +1924,101 @@ function renderHeadlines(clickedDate) {
         btn.style.display = "none";
         hint.style.display = "block";
     }
-
-    // Separate upcoming from past, then group by date
     var upcoming = filtered.filter(function(h){ return h.upcoming; });
     var past = filtered.filter(function(h){ return !h.upcoming; });
-
-    // Group by date
-    var groups = {};
-    var dateOrder = [];
-    // Upcoming dates first (ascending — soonest first)
+    var groups = {}, dateOrder = [];
     upcoming.sort(function(a,b){ return a.date.localeCompare(b.date); });
-    upcoming.forEach(function(h){
-        if (!groups[h.date]) { groups[h.date] = []; dateOrder.push(h.date); }
-        groups[h.date].push(h);
-    });
-    // Then past dates (descending — most recent first)
-    past.forEach(function(h){
-        if (!groups[h.date]) { groups[h.date] = []; dateOrder.push(h.date); }
-        groups[h.date].push(h);
-    });
-    // dateOrder already has upcoming (asc) then past (desc) — no re-sort needed
-
-    var out = "";
-    var shown = 0;
-    for (var i = 0; i < dateOrder.length && shown < 20; i++) {
-        var d = dateOrder[i];
-        var items = groups[d];
-        var dt = new Date(d + "T12:00:00");
-        var nice = dt.toLocaleDateString("en-US", {year:"numeric",month:"short",day:"numeric",weekday:"short"});
-        var isUpcomingDay = items.some(function(h){ return h.upcoming; });
-
-        if (isUpcomingDay) {
-            out += '<div class="day-header" style="color:#fbbf24;">' + nice + '</div>';
-        } else {
-            out += '<div class="day-header">' + nice + '</div>';
-        }
-        var mx = Math.min(items.length, 5);
-        for (var j = 0; j < mx; j++) {
-            var h = items[j];
-            var src = h.source ? ' <span class="headline-src">&mdash; ' + h.source + '</span>' : "";
-            var tag = h.upcoming ? '<span class="upcoming-tag">UPCOMING</span>' : "";
-            var cls = h.upcoming ? "headline-item headline-upcoming" : "headline-item";
-            if (h.url) {
-                out += '<div class="' + cls + '">&bull; <a href="' + h.url + '" target="_blank">' + h.title + '</a>' + tag + src + '</div>';
-            } else {
-                out += '<div class="' + cls + '">&bull; ' + h.title + tag + src + '</div>';
-            }
+    upcoming.forEach(function(h){ if(!groups[h.date]){groups[h.date]=[];dateOrder.push(h.date);} groups[h.date].push(h); });
+    past.forEach(function(h){ if(!groups[h.date]){groups[h.date]=[];dateOrder.push(h.date);} groups[h.date].push(h); });
+    var out = "", shown = 0;
+    for (var i=0; i<dateOrder.length && shown<20; i++) {
+        var d=dateOrder[i], items=groups[d];
+        var dt=new Date(d+"T12:00:00");
+        var nice=dt.toLocaleDateString("en-US",{year:"numeric",month:"short",day:"numeric",weekday:"short"});
+        var isUp=items.some(function(h){return h.upcoming;});
+        out += '<div class="day-header"'+(isUp?' style="color:#fbbf24;"':'')+'>' + nice + '</div>';
+        var mx=Math.min(items.length,5);
+        for(var j=0;j<mx;j++){
+            var h=items[j];
+            var src=h.source?' <span class="headline-src">&mdash; '+h.source+'</span>':"";
+            var tag=h.upcoming?'<span class="upcoming-tag">UPCOMING</span>':"";
+            var cls=h.upcoming?"headline-item headline-upcoming":"headline-item";
+            if(h.url){out+='<div class="'+cls+'">&bull; <a href="'+h.url+'" target="_blank">'+h.title+'</a>'+tag+src+'</div>';}
+            else{out+='<div class="'+cls+'">&bull; '+h.title+tag+src+'</div>';}
         }
         shown++;
     }
-    if (!out) {
-        out = '<div style="color:#666;padding:12px 0;font-size:0.76rem;">No headlines for this period.</div>';
-    }
+    if(!out) out='<div style="color:#666;padding:12px 0;font-size:0.76rem;">No headlines for this period.</div>';
     list.innerHTML = out;
-    // Scroll to top of list
     list.scrollTop = 0;
 }
-
-function clearFilter() {
-    renderHeadlines(null);
-}
-
-// Initial render
+function clearFilter(){ renderHeadlines(null); }
 renderHeadlines(null);
 
-// Attach plotly_click — poll until the chart is ready, then listen continuously
+/* ── Yahoo Finance-style header update ── */
+function fmtPrice(v){ return "$" + v.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function updateHeader(price, score, dateStr, refPrice) {
+    var el = document.getElementById;
+    document.getElementById("chPrice").textContent = fmtPrice(price);
+    var chg = price - refPrice;
+    var chgPct = refPrice ? (chg/refPrice*100) : 0;
+    var arrow = chg >= 0 ? "\\u25B2" : "\\u25BC";
+    var color = chg >= 0 ? "#22c55e" : "#ef4444";
+    var ce = document.getElementById("chChange");
+    ce.textContent = arrow + " " + (chg>=0?"+":"") + chg.toFixed(2) + " (" + (chgPct>=0?"+":"") + chgPct.toFixed(2) + "%)";
+    ce.style.color = color;
+    document.getElementById("chScore").textContent = "Score " + (score>=0?"+":"") + score.toFixed(3);
+    document.getElementById("chDate").textContent = dateStr;
+}
+// Set initial header
+(function(){
+    var chg = DEFAULT_PRICE - PREV_PRICE;
+    var pct = PREV_PRICE ? (chg/PREV_PRICE*100) : 0;
+    var arrow = chg>=0?"\\u25B2":"\\u25BC";
+    var color = chg>=0?"#22c55e":"#ef4444";
+    var ce = document.getElementById("chChange");
+    ce.textContent = arrow + " " + (chg>=0?"+":"") + chg.toFixed(2) + " (" + (pct>=0?"+":"") + pct.toFixed(2) + "%)";
+    ce.style.color = color;
+})();
+
+/* ── Chart interaction: crosshair dots + header update ── */
 (function() {
     var ready = false;
     function tryAttach() {
         var gd = document.getElementById("goldChart");
-        if (!gd || !gd._fullLayout) {
-            setTimeout(tryAttach, 150);
-            return;
-        }
+        if (!gd || !gd._fullLayout) { setTimeout(tryAttach, 150); return; }
         if (ready) return;
         ready = true;
 
-        // Use Plotly's own event system which fires on every click
+        // Store original full data ranges for period buttons
+        var origXRange = [gd.data[0].x[0], gd.data[0].x[gd.data[0].x.length-1]];
+
+        // Click → filter headlines
         gd.on("plotly_click", function(evtData) {
             if (evtData && evtData.points && evtData.points.length > 0) {
                 renderHeadlines(String(evtData.points[0].x));
             }
         });
 
-        // Hover dots — draw SVG circles on each trace at the hovered x position
         var dotColors = ["#FFD700", "#60a5fa"];
 
+        // Hover → draw dots + update header
         gd.on("plotly_hover", function(evtData) {
-            // Remove previous dots
             gd.querySelectorAll(".hover-dot").forEach(function(el){ el.remove(); });
             if (!evtData || !evtData.points) return;
             var svg = gd.querySelector(".main-svg");
             if (!svg) return;
 
+            var price = null, score = null, dateStr = "";
             evtData.points.forEach(function(pt) {
                 var xa = gd._fullLayout.xaxis;
                 var yaKey = pt.fullData.yaxis === "y2" ? "yaxis2" : "yaxis";
                 var ya = gd._fullLayout[yaKey];
                 if (!xa || !ya) return;
-
                 var px = xa.l2p(xa.d2c(pt.x)) + xa._offset;
                 var py = ya.l2p(pt.y) + ya._offset;
 
-                var dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                var dot = document.createElementNS("http://www.w3.org/2000/svg","circle");
                 dot.setAttribute("cx", px);
                 dot.setAttribute("cy", py);
                 dot.setAttribute("r", 5);
@@ -2009,11 +2028,37 @@ renderHeadlines(null);
                 dot.setAttribute("class", "hover-dot");
                 dot.setAttribute("pointer-events", "none");
                 svg.appendChild(dot);
+
+                if (pt.traceIndex === 0) { price = pt.y; dateStr = String(pt.x).split("T")[0]; }
+                if (pt.traceIndex === 1) { score = pt.y; }
             });
+            if (price !== null) {
+                updateHeader(price, score || DEFAULT_SCORE, dateStr, PREV_PRICE);
+            }
         });
 
+        // Unhover → restore default header + remove dots
         gd.on("plotly_unhover", function() {
             gd.querySelectorAll(".hover-dot").forEach(function(el){ el.remove(); });
+            updateHeader(DEFAULT_PRICE, DEFAULT_SCORE, DEFAULT_DATE, PREV_PRICE);
+        });
+
+        // ── Period selector buttons ──
+        document.querySelectorAll(".period-btn").forEach(function(btn) {
+            btn.addEventListener("click", function() {
+                document.querySelectorAll(".period-btn").forEach(function(b){ b.classList.remove("active"); });
+                this.classList.add("active");
+                var months = parseInt(this.getAttribute("data-months"));
+                if (months === 0) {
+                    // Max — show all data
+                    Plotly.relayout(gd, {"xaxis.autorange": true});
+                } else {
+                    var endDate = new Date(origXRange[1]);
+                    var startDate = new Date(endDate);
+                    startDate.setMonth(startDate.getMonth() - months);
+                    Plotly.relayout(gd, {"xaxis.range": [startDate.toISOString().split("T")[0], endDate.toISOString().split("T")[0]]});
+                }
+            });
         });
     }
     tryAttach();
@@ -2023,7 +2068,7 @@ renderHeadlines(null);
 </html>
 """
 
-    components.html(interactive_html, height=760, scrolling=True)
+    components.html(interactive_html, height=780, scrolling=True)
 
 else:
     st.info("Insufficient data to render dual-axis chart.")
