@@ -4,6 +4,7 @@ Market Intelligence: Gold - Full 47-Factor Dynamic Engine
 Calculates 5Y Means, Z-Scores, and Percentiles dynamically from historical API data.
 """
 
+import os
 import ssl
 import re
 import json
@@ -27,229 +28,52 @@ fred = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
 
 st.set_page_config(page_title="Market Intelligence: Gold", layout="wide")
 
-# ─── Factor Configuration (All 47 Factors + Sub-factors) ─────────────────────
-# Each factor has:
-#   ind            - display name
-#   ticker         - data series identifier
-#   source         - FRED / YF / YF_RATIO / SIMULATED
-#   weight         - importance weight (1-5)
-#   higher_is_bullish - directional interpretation for scoring
-#   why            - short reason why it matters for gold
-#   definition     - full plain-English explanation (shown on hover)
-#   unit           - measurement unit appended to the Value column
+# FT-style page background
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #FFF1E5;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-FACTOR_CONFIG = {
-    "I. Macro-Monetary Drivers": [
-        {"ind": "1. US Real Rates (10Y TIPS)", "ticker": "DFII10", "source": "FRED", "weight": 5, "higher_is_bullish": False, "why": "High real yield competes with metals.",
-         "definition": "The yield on 10-Year Treasury Inflation-Protected Securities (TIPS). Represents the real (after-inflation) return investors demand for lending to the US government for 10 years. When positive, bonds offer a real return that competes with non-yielding gold. When negative, holding gold has zero opportunity cost vs bonds.",
-         "unit": "%"},
-        {"ind": "1A. Fed Funds Real Rate", "ticker": "FEDFUNDS_REAL", "source": "SIMULATED", "weight": 4, "higher_is_bullish": False, "why": "Negative real rates are historically bullish.",
-         "definition": "The effective Federal Funds Rate minus the 5-Year Breakeven Inflation Rate. Measures whether the Fed's policy rate is above or below expected inflation. Deeply negative real Fed Funds rates (like 2020-2022) historically coincide with gold bull markets because cash loses purchasing power.",
-         "unit": "%"},
-        {"ind": "1B. 5Y Real Rates", "ticker": "DFII5", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Impacts medium-term carrying costs.",
-         "definition": "The yield on 5-Year TIPS. A shorter-duration measure of real interest rates than the 10Y, more sensitive to near-term Fed policy expectations. Reflects the medium-term opportunity cost of holding gold versus inflation-protected bonds.",
-         "unit": "%"},
-        {"ind": "1C. Global Real Rates (Weighted)", "ticker": "GLB_REAL", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Global opportunity cost.",
-         "definition": "A GDP-weighted composite of real policy rates across major economies (US, Eurozone, Japan, UK, China). Gold is priced globally, so if real rates are negative worldwide, the bid for gold is structurally stronger than if only one country has low rates.",
-         "unit": "%"},
-        {"ind": "2. Breakeven Inflation (5Y)", "ticker": "T5YIE", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Market-implied inflation expectation.",
-         "definition": "The difference between the 5-Year nominal Treasury yield and the 5-Year TIPS yield. This spread represents the bond market's consensus expectation for average annual inflation over the next 5 years. Higher breakevens signal rising inflation fears, which drive demand for gold as an inflation hedge.",
-         "unit": "%"},
-        {"ind": "2A. UMich Inflation Expectations", "ticker": "MICH", "source": "FRED", "weight": 2, "higher_is_bullish": True, "why": "Consumer inflation sentiment.",
-         "definition": "The University of Michigan Survey of Consumers' median expectation for inflation over the next 12 months. Unlike breakevens (market-based), this captures household sentiment. Spikes in consumer inflation expectations often precede retail gold buying waves and can become self-fulfilling.",
-         "unit": "%"},
-        {"ind": "2B. Cleveland Fed Nowcast", "ticker": "CLEV_INFL", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "High-frequency inflation indicator.",
-         "definition": "The Cleveland Fed's real-time estimate of current-month inflation using Treasury yields, inflation swaps, and survey data. Provides a more timely read than CPI (which is released with a lag). Persistent above-target readings support the inflation-hedge narrative for gold.",
-         "unit": "%"},
-        {"ind": "3. Global Liquidity (M2)", "ticker": "M2SL", "source": "FRED", "weight": 5, "higher_is_bullish": True, "why": "Expansions in M2 debase fiat currencies.",
-         "definition": "The US M2 money supply: cash, checking deposits, savings, money market funds, and small CDs. Used as a proxy for global liquidity since the USD is the world reserve currency. When M2 expands rapidly (like 2020-2021's 40% surge), more dollars chase finite gold ounces, driving prices higher.",
-         "unit": "$B"},
-        {"ind": "3A. US Debt/GDP Ratio", "ticker": "GFDEGDQ188S", "source": "FRED", "weight": 4, "higher_is_bullish": True, "why": "Unsustainable debt implies future monetization.",
-         "definition": "Total US federal government debt as a percentage of GDP. When this ratio rises above ~100%, markets begin pricing in the risk that the government will need to inflate away its debt (financial repression), rather than repay it through growth or austerity. This structural debasement risk underpins long-term gold demand.",
-         "unit": "% GDP"},
-        {"ind": "3B. Deficit as % of GDP", "ticker": "FYFSGDA188S", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Larger deficits (more negative) weaken currency, bullish for gold.",
-         "definition": "The annual US federal budget deficit expressed as a percentage of GDP (shown as positive = deficit size). Large fiscal deficits mean the government is spending far more than it collects in taxes, which must be financed by borrowing or money creation. Persistent 5%+ deficits outside recessions signal structural fiscal deterioration.",
-         "unit": "% GDP"},
-        {"ind": "3C. Debt Service Costs", "ticker": "A091RC1Q027SBEA", "source": "FRED", "weight": 4, "higher_is_bullish": True, "why": "Forces central banks into yield curve control.",
-         "definition": "Federal government interest payments on outstanding debt, in billions per quarter (annualized). When interest costs consume a large share of tax revenue, the Fed faces pressure to keep rates artificially low (financial repression / yield curve control) to prevent a debt spiral. This environment is extremely bullish for gold.",
-         "unit": "$B/yr"},
-        {"ind": "4. Nominal Yield Curve", "ticker": "T10Y2Y", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Steepening indicates normalization.",
-         "definition": "The spread between the 10-Year and 2-Year US Treasury yields. A positive (steep) curve means long-term rates are higher than short-term rates, which is normal. An inverted curve (negative spread) signals recession expectations. A steepening from inversion is bullish for gold as it often precedes rate cuts and easing cycles.",
-         "unit": "pp"},
-        {"ind": "5. Currency Strength (DXY)", "ticker": "DX-Y.NYB", "source": "YF", "weight": 5, "higher_is_bullish": False, "why": "Inverse correlation to USD pricing.",
-         "definition": "The US Dollar Index, measuring the dollar against a basket of 6 major currencies (EUR 57.6%, JPY 13.6%, GBP 11.9%, CAD 9.1%, SEK 4.2%, CHF 3.6%). Since gold is priced in USD, a weaker dollar mechanically makes gold cheaper for foreign buyers, boosting demand. The DXY-gold correlation is roughly -0.8 over long periods.",
-         "unit": "pts"},
-        {"ind": "6. Credit Spreads (HY)", "ticker": "BAMLH0A0HYM2", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Tight spreads reflect low systemic fear.",
-         "definition": "The ICE BofA US High Yield Master II Option-Adjusted Spread: the extra yield (in percentage points) that junk bond investors demand over Treasuries. Tight spreads (<3.5%) signal complacency and risk-on sentiment. Blowouts (>6%) signal credit stress and flight-to-safety flows into gold.",
-         "unit": "%"}
-    ],
-    "II. Market Structure & Positioning": [
-        {"ind": "7. Managed Money Position", "ticker": "COT_MM", "source": "CFTC", "weight": 4, "higher_is_bullish": False, "why": "Crowded longs risk sharp liquidations.",
-         "definition": "Net long/short position of Managed Money traders (hedge funds, CTAs) in COMEX gold futures, from the CFTC Commitments of Traders report. Extreme net long positioning (Z-score > 2.0) signals a crowded trade vulnerable to sharp liquidation. Extreme short positioning signals contrarian bullish potential.",
-         "unit": "contracts"},
-        {"ind": "8. Swap Dealer Position", "ticker": "COT_SD", "source": "CFTC", "weight": 3, "higher_is_bullish": True, "why": "Commercial positioning is the 'smart money'.",
-         "definition": "Net position of Swap Dealers (major banks facilitating OTC gold transactions) in COMEX gold futures. These entities are considered 'smart money' because they have superior information about physical flows. When swap dealers reduce their typical net short, it signals reduced hedging demand or outright bullishness.",
-         "unit": "contracts"},
-        {"ind": "9. Open Interest", "ticker": "COMEX_OI", "source": "CFTC", "weight": 2, "higher_is_bullish": True, "why": "Reflects total speculative participation.",
-         "definition": "Total number of outstanding (unsettled) gold futures contracts on COMEX. Rising OI with rising prices confirms new money entering bullish bets. Rising OI with falling prices signals aggressive new shorts. Falling OI indicates position liquidation regardless of price direction.",
-         "unit": "contracts"},
-        {"ind": "10. Futures Structure", "ticker": "FUT_CURVE", "source": "YF_CALC", "weight": 2, "higher_is_bullish": True, "why": "Backwardation indicates tight physical supply.",
-         "definition": "The shape of the gold futures term structure, measured as the spread between front-month COMEX gold futures (GC=F) and a spot proxy (GLD ETF x conversion factor). Positive = contango (normal), negative = backwardation (rare, bullish). Backwardation signals extreme physical demand or delivery stress.",
-         "unit": "$/oz"},
-        {"ind": "11. Options Skew", "ticker": "OPT_SKEW", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "Heavy call skew implies topside exhaustion.",
-         "definition": "The 25-Delta Risk Reversal: the implied volatility of 25-delta calls minus 25-delta puts on gold options. Positive values (call premium) mean the market is paying more for upside protection, suggesting bullish consensus is already priced in. Negative values (put premium) suggest fear and hedging activity.",
-         "unit": "vol pts"}
-    ],
-    "III. Physical Fundamentals & Flow": [
-        {"ind": "12. Shanghai Premium", "ticker": "SGE_PREM", "source": "SGE_API", "weight": 4, "higher_is_bullish": True, "why": "Indicates physical demand strength in Asia.",
-         "definition": "The premium (or discount) of gold on the Shanghai Gold Exchange versus COMEX, in $/oz. Calculated from the SGE daily benchmark price (CNY/gram) converted to USD/oz via the CNY/USD exchange rate, minus the COMEX front-month futures price. Positive premiums signal strong Chinese physical demand.",
-         "unit": "$/oz"},
-        {"ind": "12A. Gold in Other Currencies", "ticker": "XAU_BASKET", "source": "YF_CALC", "weight": 3, "higher_is_bullish": True, "why": "Broad cross-currency strength.",
-         "definition": "Gold's performance measured against a basket of non-USD currencies (EUR, GBP, JPY, CNY). Calculated as the equal-weighted average of gold priced in each currency via YF FX rates. When gold makes new highs in most currencies simultaneously, it signals genuine global repricing rather than just USD weakness.",
-         "unit": "index"},
-        {"ind": "13. Indian Demand Premium", "ticker": "IN_PREM", "source": "SIMULATED", "weight": 4, "higher_is_bullish": True, "why": "Core cultural and seasonal demand indicator.",
-         "definition": "The premium or discount at which gold trades in India versus international benchmarks. India is the world's second-largest gold consumer. Premiums indicate strong local demand (often seasonal around Diwali and wedding season). Discounts signal weak demand or import restrictions.",
-         "unit": "$/oz"},
-        {"ind": "13A. India Wedding Season", "ticker": "IN_WEDDING", "source": "CALENDAR", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
-         "definition": "A seasonal indicator tracking India's wedding season intensity. Score 100 = peak season (Oct-Feb, especially Diwali and post-harvest weddings), 50 = shoulder (Mar, Sep), 25 = off-season (Apr-Aug). Indian weddings drive enormous gold jewelry demand, adding 100-200 tonnes of incremental annual demand during peak months.",
-         "unit": "0-100"},
-        {"ind": "13B. China Lunar New Year", "ticker": "CN_LNY", "source": "CALENDAR", "weight": 2, "higher_is_bullish": True, "why": "Cyclical demand boosts.",
-         "definition": "A seasonal indicator for Chinese gold demand. Score 100 = peak gifting/buying season (Jan-Feb around Lunar New Year and Golden Week in Oct), 50 = shoulder months, 25 = off-season. Gold gifting is a deeply embedded cultural tradition; demand typically surges 4-6 weeks before the holiday.",
-         "unit": "0-100"},
-        {"ind": "14. ETF Flows (GLD Volume)", "ticker": "ETF_FLOWS", "source": "YF_CALC", "weight": 3, "higher_is_bullish": True, "why": "Institutional and retail accumulation.",
-         "definition": "20-day average daily dollar volume of the SPDR Gold Trust (GLD), the largest physically-backed gold ETF. Rising volume indicates increasing institutional and retail interest in gold exposure. Used as a proxy for ETF flow momentum since actual tonnage flow data requires paid subscriptions.",
-         "unit": "$B"},
-        {"ind": "14A. US Mint Coin Sales", "ticker": "US_MINT", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Retail physical demand proxy.",
-         "definition": "Monthly sales of American Gold Eagle and American Gold Buffalo coins by the US Mint. A direct measure of retail/individual investor demand for physical gold. Spikes in coin sales (like March 2020) often coincide with financial stress or loss of confidence in the monetary system.",
-         "unit": "oz"},
-        {"ind": "14B. Retail Premium Over Spot", "ticker": "RETAIL_PREM", "source": "SIMULATED", "weight": 1, "higher_is_bullish": True, "why": "Dealer physical supply constraints.",
-         "definition": "The percentage premium that retail gold products (coins, small bars) trade above the spot price. Normal premiums are 3-5%. Premiums above 8-10% indicate physical supply constraints at the retail level, often a sign of panic buying or minting bottlenecks.",
-         "unit": "%"},
-        {"ind": "15. COMEX Inventory", "ticker": "COMEX_INV", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Falling stocks signal physical market tightness.",
-         "definition": "Total registered (eligible for delivery) gold inventory in COMEX-approved warehouses, measured in troy ounces. Falling registered inventory means physical gold is being withdrawn for delivery rather than remaining as exchange collateral. Rapid drawdowns signal that paper claims are being converted to physical metal.",
-         "unit": "M oz"},
-        {"ind": "15A. Scrap/Recycling Flows", "ticker": "SCRAP_FLOW", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "High scrap rates cap price rallies.",
-         "definition": "The volume of recycled gold entering the market from old jewelry, electronics, and dental scrap. High prices incentivize consumers and recyclers to sell, creating a natural price ceiling. Scrap supply typically represents 25-30% of annual gold supply.",
-         "unit": "tonnes"},
-        {"ind": "16. Central Bank Buying", "ticker": "CB_BUYING", "source": "SIMULATED", "weight": 5, "higher_is_bullish": True, "why": "Provides a structural floor to prices.",
-         "definition": "Net gold purchases by central banks worldwide, reported quarterly by the World Gold Council. Since 2010, central banks have been net buyers, with purchases accelerating to 1,000+ tonnes/year in 2022-2023. This represents a structural shift in reserve management away from USD assets and toward gold.",
-         "unit": "tonnes/yr"}
-    ],
-    "IV. Supply Side & Mining Economics": [
-        {"ind": "17. All-in Sustaining Costs", "ticker": "AISC", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Higher production costs create a price floor.",
-         "definition": "The All-In Sustaining Cost per ounce to produce gold, including mining, processing, refining, sustaining capex, corporate G&A, and exploration. Published quarterly by mining companies. The global average AISC (~$1,300-1,400/oz in 2024) acts as a price floor: below this, mines shut down, reducing supply.",
-         "unit": "$/oz"},
-        {"ind": "18. Mine Supply Growth", "ticker": "MINE_SUPPLY", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Peak gold dynamics restrict new supply.",
-         "definition": "Year-over-year growth in global gold mine production, in tonnes. Mine supply has plateaued at ~3,600 tonnes/year as new discoveries decline and ore grades fall. Flat-to-declining supply growth combined with rising demand creates a structural deficit.",
-         "unit": "tonnes/yr"},
-        {"ind": "19. Mining Capex Cycle", "ticker": "MINING_CAPEX", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Underinvestment limits future mine output.",
-         "definition": "Aggregate capital expenditure by major gold miners on new mine development, expansion, and exploration. After the 2013-2015 downturn, the industry drastically cut capex. It takes 10-15 years from discovery to first production, so today's underinvestment guarantees constrained supply in the late 2020s and 2030s.",
-         "unit": "$B/yr"},
-        {"ind": "20. Miner Hedging Activity", "ticker": "HEDGING", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Forward selling suppresses spot prices.",
-         "definition": "The total volume of gold production that miners have sold forward in futures/options markets. Heavy hedging (forward selling) locks in current prices but creates selling pressure in the futures market. Low hedging signals miner confidence that prices will rise, and reduces overhead supply pressure.",
-         "unit": "M oz"},
-        {"ind": "21. Reserve Depletion", "ticker": "RESERVES", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Falling high-grade reserves forces premiums.",
-         "definition": "Total global proven and probable gold reserves in the ground, measured in million ounces. The gold mining industry has struggled to replace depleted reserves through new discoveries. Declining reserve life (years of reserves remaining at current production rates) implies future scarcity premiums.",
-         "unit": "M oz"}
-    ],
-    "V. Banking System & Liquidity": [
-        {"ind": "22. TED Spread", "ticker": "TEDRATE", "source": "FRED", "weight": 2, "higher_is_bullish": False, "why": "Measures perceived credit risk in banking.",
-         "definition": "The spread between 3-Month LIBOR (interbank lending rate) and the 3-Month Treasury bill yield. Widening TED spread signals that banks are charging each other more to lend, reflecting rising counterparty risk fears. Spikes (like 2008's 4.5%) trigger safe-haven flows into gold. Note: LIBOR was discontinued in 2023; SOFR-based spreads are the modern equivalent.",
-         "unit": "%"},
-        {"ind": "23. SOFR-OIS Spread", "ticker": "SOFR_OIS", "source": "FRED_CALC", "weight": 2, "higher_is_bullish": False, "why": "Interbank liquidity stress.",
-         "definition": "The spread between SOFR (Secured Overnight Financing Rate) and the effective Federal Funds Rate (OIS proxy), in basis points. Both from FRED. The modern replacement for the TED Spread after LIBOR's discontinuation. Widening signals stress in short-term secured funding markets.",
-         "unit": "bps"},
-        {"ind": "24. Fed Reverse Repo Usage", "ticker": "RRPONTSYD", "source": "FRED", "weight": 3, "higher_is_bullish": False, "why": "Drains excess liquidity from the system.",
-         "definition": "The total dollar amount parked overnight at the Federal Reserve's Reverse Repo Facility (RRP). Money market funds and banks use the RRP to earn a risk-free return. High RRP usage (>$2T in 2022-2023) means excess liquidity is being drained from the financial system. As the RRP drains toward zero, that liquidity re-enters markets.",
-         "unit": "$T"},
-        {"ind": "25. Commercial Bank Reserves", "ticker": "TOTRESNS", "source": "FRED", "weight": 3, "higher_is_bullish": True, "why": "Base money supply availability.",
-         "definition": "Total reserves held by commercial banks at the Federal Reserve, in billions. These reserves are the foundation of the money multiplier: banks lend against them. Rising reserves mean the banking system has ample liquidity for credit creation. When reserves fall below a critical threshold (~$3T), funding stress emerges.",
-         "unit": "$B"},
-        {"ind": "26. Basel III NSFR Impact", "ticker": "NSFR_IMPACT", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Regulatory unallocated gold constraints.",
-         "definition": "The estimated impact of Basel III's Net Stable Funding Ratio (NSFR) requirement on bank gold trading. Under Basel III, unallocated gold (paper gold held on bank balance sheets) requires 85% stable funding backing, making it far more expensive for banks to maintain. This forces a shift from paper to physical gold, tightening the physical market.",
-         "unit": "index"}
-    ],
-    "VI. Ratios & Relative Value": [
-        {"ind": "27. Gold/Silver Ratio", "ticker": "GC=F/SI=F", "source": "YF_RATIO", "weight": 3, "higher_is_bullish": False, "why": "High ratio historically reverts.",
-         "definition": "The number of ounces of silver it takes to buy one ounce of gold. Historical average is ~60-65x. Above 80x signals silver is extremely cheap relative to gold (and precious metals may be underowned). Below 50x signals silver overvaluation or late-stage bull market euphoria. The ratio tends to mean-revert violently.",
-         "unit": "x"},
-        {"ind": "27A. Gold vs Bitcoin", "ticker": "GC=F/BTC-USD", "source": "YF_RATIO", "weight": 1, "higher_is_bullish": False, "why": "Alternative store of value competition.",
-         "definition": "Gold price divided by Bitcoin price, showing gold's value in BTC terms. A rising ratio means gold is outperforming Bitcoin as a store of value. A falling ratio signals capital rotating from gold into crypto. This rivalry is most relevant for younger institutional allocators choosing between 'digital gold' and physical gold.",
-         "unit": "ratio"},
-        {"ind": "27B. Gold vs Real Estate", "ticker": "GC=F/VNQ", "source": "YF_RATIO", "weight": 2, "higher_is_bullish": True, "why": "Hard asset relative strength.",
-         "definition": "Gold price divided by the Vanguard Real Estate ETF (VNQ) price. Measures gold's purchasing power relative to real estate assets. A rising ratio means gold is outperforming property, often during periods of financial stress when real estate is under pressure but gold benefits from safe-haven flows.",
-         "unit": "ratio"},
-        {"ind": "27C. Gold as % of Global Assets", "ticker": "AU_ALLOCATION", "source": "SIMULATED", "weight": 3, "higher_is_bullish": False, "why": "Under-allocation signals room for institutional buying.",
-         "definition": "Gold's total market capitalization as a percentage of total global financial assets (~$500T including equities, bonds, real estate). Currently around 1-2%. At past cycle peaks (1980, 2011), gold's share reached 3-5%. Even a small reallocation from bonds to gold by pension funds and sovereign wealth funds would require enormous physical purchases.",
-         "unit": "%"},
-        {"ind": "28. Gold/Oil Ratio", "ticker": "GC=F/CL=F", "source": "YF_RATIO", "weight": 2, "higher_is_bullish": True, "why": "Purchasing power of gold vs energy.",
-         "definition": "The number of barrels of oil that one ounce of gold can buy. Long-term average is ~15-20 barrels. A high ratio (>25) means gold is expensive vs energy, often reflecting safe-haven demand. An extremely low ratio (<10) signals gold is undervalued relative to the real economy's energy needs.",
-         "unit": "bbl/oz"},
-        {"ind": "29. Gold/S&P 500", "ticker": "GC=F/^GSPC", "source": "YF_RATIO", "weight": 3, "higher_is_bullish": True, "why": "Relative performance against risk assets.",
-         "definition": "Gold price divided by the S&P 500 index level. Measures whether gold or equities are leading. A rising ratio means gold is outperforming stocks, typically during recessions, financial crises, or inflationary regimes. A falling ratio signals risk-on conditions where equities dominate returns.",
-         "unit": "ratio"},
-        {"ind": "30. Platinum/Gold", "ticker": "PL=F/GC=F", "source": "YF_RATIO", "weight": 2, "higher_is_bullish": False, "why": "Industrial cycle divergences.",
-         "definition": "Platinum price divided by gold price. Historically, platinum traded at a premium to gold due to its rarity and industrial uses. Since 2015, this ratio has collapsed below 0.5x, signaling either extreme platinum undervaluation or that gold's monetary premium has decoupled from industrial metals. A low ratio often signals industrial weakness.",
-         "unit": "ratio"},
-        {"ind": "31. Gold/M2 Ratio", "ticker": "AU_M2", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Value of gold relative to fiat expansion.",
-         "definition": "Gold price per ounce divided by US M2 money supply (in billions). Measures whether gold has kept pace with monetary expansion. A rising ratio means gold is outpacing money printing. A falling ratio means gold is getting cheaper relative to the amount of dollars in circulation, signaling potential undervaluation.",
-         "unit": "ratio"}
-    ],
-    "VII. Technical Indicators": [
-        {"ind": "32. Moving Averages", "ticker": "MA_BULL", "source": "SIMULATED", "weight": 4, "higher_is_bullish": True, "why": "Trend confirmation.",
-         "definition": "A composite signal: counts how many key moving averages (50-day, 200-day) gold's price is currently above. Value of 2 = above both (strong uptrend), 1 = above one (mixed), 0 = below both (downtrend). A 'Golden Cross' (50D crossing above 200D) is a widely-followed bullish signal; a 'Death Cross' is the inverse.",
-         "unit": "/2"},
-        {"ind": "33. Bollinger Bands", "ticker": "BB_EXP", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Volatility envelope extension.",
-         "definition": "The width of the 20-day Bollinger Bands as a percentage of the middle band (20-day SMA). Measures volatility expansion/contraction. Narrow bands ('squeeze') signal low volatility preceding a breakout. Wide bands signal high volatility and potential exhaustion. Expanding width during a trend confirms momentum; extreme width can signal overbought conditions.",
-         "unit": "%"},
-        {"ind": "34. RSI Divergence", "ticker": "RSI_DIV", "source": "SIMULATED", "weight": 2, "higher_is_bullish": False, "why": "Momentum exhaustion indicator.",
-         "definition": "The 14-day Relative Strength Index for gold. RSI oscillates 0-100, measuring the speed and magnitude of recent price changes. Above 70 = overbought (potential pullback risk). Below 30 = oversold (potential bounce). Most useful when RSI diverges from price: price makes new highs but RSI doesn't, signaling weakening momentum.",
-         "unit": "0-100"},
-        {"ind": "35. Volume Profile", "ticker": "VOL_PROF", "source": "YF_CALC", "weight": 1, "higher_is_bullish": True, "why": "Support level consolidation.",
-         "definition": "The 20-day average daily trading volume of GC=F gold futures, normalized as a ratio to the 5Y average volume. Values above 1.0 indicate above-average participation. Rising volume during price advances confirms trend strength and institutional conviction. Falling volume during rallies warns of weak hands.",
-         "unit": "ratio"}
-    ],
-    "VIII. Black Swan & Exogenous Risks": [
-        {"ind": "36. Equity and Gold Volatility", "ticker": "^VIX", "source": "YF", "weight": 2, "higher_is_bullish": True, "why": "Spikes trigger safe-haven capital flight.",
-         "definition": "The CBOE Volatility Index (VIX), derived from S&P 500 option prices. Represents the market's expectation of 30-day annualized equity volatility. Known as the 'fear gauge.' VIX spikes above 30 signal acute market stress and typically trigger safe-haven flows into gold. Sustained elevated VIX (>25) supports gold's risk premium.",
-         "unit": "vol pts"},
-        {"ind": "37. Geopolitical Risk", "ticker": "GPR_IDX", "source": "WEB_CSV", "weight": 3, "higher_is_bullish": True, "why": "Reflects safe-haven tail risk premiums.",
-         "definition": "The Caldara-Iacoviello Geopolitical Risk Index, constructed by counting newspaper articles related to geopolitical tensions, wars, and terrorism. Baseline 100 = 1985-2019 average. Published monthly by Matteo Iacoviello (Federal Reserve Board). Gold has historically rallied 5-15% during acute geopolitical crises.",
-         "unit": "index"},
-        {"ind": "38. US CDS", "ticker": "US_CDS", "source": "SIMULATED", "weight": 1, "higher_is_bullish": True, "why": "Sovereign default risk proxies.",
-         "definition": "The cost of credit default swap (CDS) protection on US sovereign debt, in basis points. CDS pricing reflects the market's perceived probability of a US government default. Spikes (like during the 2023 debt ceiling crisis) signal sovereign risk concerns that directly benefit gold as the ultimate 'money of last resort.'",
-         "unit": "bps"},
-        {"ind": "39. Lease Rates", "ticker": "LEASE_RATE", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Physical market leasing stress.",
-         "definition": "The annualized rate that central banks and institutions charge to lend physical gold (historically derived from GOFO minus LIBOR, now from SOFR-based benchmarks). Rising lease rates signal that physical gold is in high demand for borrowing, often because shorts need to locate metal for delivery. Elevated rates precede supply squeezes.",
-         "unit": "% ann."},
-        {"ind": "40. Dealer Gamma", "ticker": "DLR_GAMMA", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "Market maker positioning impacts volatility.",
-         "definition": "Estimated aggregate gamma exposure (GEX) of market makers in gold options. When dealers are 'long gamma,' they dampen volatility by buying dips and selling rips. When dealers are 'short gamma,' they must sell into declines and buy into rallies, amplifying moves. Short gamma environments produce outsized gold price swings.",
-         "unit": "$M/pt"},
-        {"ind": "41. EFP Spread", "ticker": "EFP_SPREAD", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Paper vs Physical arbitrage dislocations.",
-         "definition": "The Exchange-for-Physical (EFP) spread: the difference between COMEX gold futures and London spot gold. Normally a small, stable spread reflecting financing costs. Blowouts (like March 2020's $70+ spread) signal severe dislocation between paper and physical markets, delivery stress, or logistical bottlenecks in moving gold between vaults.",
-         "unit": "$/oz"},
-        {"ind": "42. Miners vs Metal", "ticker": "GDX/GLD", "source": "YF_RATIO", "weight": 2, "higher_is_bullish": True, "why": "Miners lead the metal in bull markets.",
-         "definition": "The ratio of the VanEck Gold Miners ETF (GDX) to the SPDR Gold Trust (GLD). Gold miners are leveraged plays on gold price — they should outperform bullion in a bull market. When GDX/GLD is rising, miners are confirming the gold rally with operational leverage. When miners lag (ratio falling), it signals skepticism about the move's sustainability.",
-         "unit": "ratio"},
-        {"ind": "43. Junior Speculation", "ticker": "GDXJ/GDX", "source": "YF_RATIO", "weight": 1, "higher_is_bullish": True, "why": "Risk-on appetite in the precious metals sector.",
-         "definition": "The ratio of the VanEck Junior Gold Miners ETF (GDXJ) to the senior Gold Miners ETF (GDX). Junior miners are smaller, higher-risk explorers and developers. When GDXJ outperforms GDX, it signals speculative risk appetite within the gold sector — investors are willing to take on more risk for higher returns, a hallmark of early-to-mid bull markets.",
-         "unit": "ratio"},
-        {"ind": "44. Silver Beta", "ticker": "SI_BETA", "source": "SIMULATED", "weight": 2, "higher_is_bullish": True, "why": "Silver outperforming signals broad bull market.",
-         "definition": "The 60-day rolling regression beta of silver futures returns against gold futures returns. A beta > 1.0 means silver moves more than gold on a percentage basis. Silver typically leads gold in strong precious metals rallies (beta 1.5-3x). Expanding beta signals growing speculative enthusiasm across the sector.",
-         "unit": "x"}
-    ],
-    "IX. Sentiment & Retail Indicators": [
-        {"ind": "45. Google Trends - Buy Gold", "ticker": "GTRENDS", "source": "PYTRENDS", "weight": 2, "higher_is_bullish": False, "why": "Retail euphoria often marks local tops.",
-         "definition": "Google search interest for 'buy gold' over the past 5 years, indexed 0-100 (weekly data via pytrends). Extreme spikes in search interest often coincide with retail FOMO buying near local price tops. Conversely, low search interest during rising prices suggests the move is under-owned and has further to run. A contrarian indicator.",
-         "unit": "0-100"},
-        {"ind": "46. Gold Advertising Spending", "ticker": "AD_SPEND", "source": "SIMULATED", "weight": 1, "higher_is_bullish": False, "why": "Late-cycle retail trapping indicator.",
-         "definition": "Estimated aggregate spending on gold-related advertising (TV, online, radio) by dealers, mints, and bullion companies. Heavy advertising spend typically targets retail investors during euphoric price runs, extracting high premiums from late buyers. Peak ad spend often correlates with local price tops — a classic contrarian sell signal.",
-         "unit": "$M/mo"},
-        {"ind": "47. Jewelry Demand", "ticker": "JEWELRY", "source": "SIMULATED", "weight": 3, "higher_is_bullish": True, "why": "Base consumer physical demand floor.",
-         "definition": "Global gold jewelry consumption in tonnes, reported quarterly by the World Gold Council. Jewelry represents ~50% of annual gold demand (~2,000 tonnes). Jewelry demand is price-sensitive (falls when prices spike) but provides a structural floor. Strong jewelry demand at elevated prices signals acceptance of a new price regime and broad consumer demand.",
-         "unit": "tonnes/yr"}
-    ]
-}
+# ─── Factor Configuration (loaded from spreadsheet) ──────────────────────────
+# Config lives in gold_scoring_config.xlsx for easy review and editing.
+# Each factor has: ind, ticker, source, weight, higher_is_bullish,
+# cluster_group, why, definition, unit
+
+def load_factor_config():
+    """Load factor configuration from gold_scoring_config.xlsx.
+    Returns OrderedDict of {category: [factor_dicts]} matching the old FACTOR_CONFIG format.
+    Falls back to an error message if the file is missing."""
+    xlsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gold_scoring_config.xlsx")
+    if not os.path.exists(xlsx_path):
+        st.error(f"Scoring config not found: {xlsx_path}")
+        return OrderedDict()
+
+    df = pd.read_excel(xlsx_path, sheet_name="Factor Config", engine="openpyxl")
+
+    config = OrderedDict()
+    for _, row in df.iterrows():
+        cat = str(row.get("Category", ""))
+        entry = {
+            "ind": str(row.get("Indicator", "")),
+            "ticker": str(row.get("Ticker", "")),
+            "source": str(row.get("Source", "")),
+            "weight": int(row.get("Weight", 1)),
+            "higher_is_bullish": bool(row.get("Higher Is Bullish", False)),
+            "cluster_group": str(row.get("Cluster Group", "")),
+            "why": str(row.get("Why", "")),
+            "definition": str(row.get("Definition", "")),
+            "unit": str(row.get("Unit", "")),
+        }
+        if cat not in config:
+            config[cat] = []
+        config[cat].append(entry)
+
+    return config
+
+FACTOR_CONFIG = load_factor_config()
 
 # ─── Dynamic Historical Data Engine ──────────────────────────────────────────
 
@@ -807,11 +631,32 @@ def calculate_statistics(series, config):
     """Dynamically calculates 5Y Mean, Std, Z-Score, and Confidence Scores"""
     unit = config.get("unit", "")
     if series is None or len(series) < 10:
-        return {"Value": "N/A", "Colour Indicator": "Yellow", "Total Factor Score": 0}
+        return {"Value": "N/A", "Colour Indicator": "Yellow", "Total Factor Score": 0,
+                "Change": "N/A", "Change Color": "gray"}
 
     current_val = float(series.iloc[-1])
     mean_5y = float(series.mean())
     std_5y = float(series.std())
+
+    # Period-over-period % change (daily or weekly depending on data frequency)
+    if len(series) >= 2:
+        prev_val = float(series.iloc[-2])
+        if abs(prev_val) > 1e-10:
+            change_pct = (current_val - prev_val) / abs(prev_val) * 100
+        else:
+            change_pct = 0.0
+        if change_pct > 0.005:
+            change_str = f"▲ +{change_pct:.2f}%"
+            change_color = "green"
+        elif change_pct < -0.005:
+            change_str = f"▼ {change_pct:.2f}%"
+            change_color = "red"
+        else:
+            change_str = "— 0.00%"
+            change_color = "gray"
+    else:
+        change_str = "N/A"
+        change_color = "gray"
 
     # Mathematical Z-Score Formula: (Current - Mean) / Std
     z_score = (current_val - mean_5y) / std_5y if std_5y != 0 else 0.0
@@ -840,6 +685,8 @@ def calculate_statistics(series, config):
 
     return {
         "Value": format_value_with_unit(current_val, unit),
+        "Change": change_str,
+        "Change Color": change_color,
         "5Y Mean": format_value_with_unit(mean_5y, unit),
         "5Y Std": f"{std_5y:.2f}",
         "Z-Score": f"{z_score:.2f}",
@@ -850,9 +697,10 @@ def calculate_statistics(series, config):
 
 def compute_rolling_scores(historical_data, n_days=50):
     """
-    Compute a daily Gold Score time series over the last n_days.
+    Compute a daily Gold Score time series over the last n_days using cluster-aware scoring.
     For each day t in the window, we treat each factor's value at day t as
     'current' and compute its z-score against the full 5Y history up to day t.
+    Factors are averaged within clusters before summing to prevent redundancy.
     Returns a pd.Series of normalized gold scores indexed by date.
     """
     end_date = datetime.now()
@@ -872,15 +720,20 @@ def compute_rolling_scores(historical_data, n_days=50):
     if len(sampled_dates) < 3:
         sampled_dates = date_range
 
-    max_possible_score = sum(
-        item['weight'] * 3
-        for indicators in FACTOR_CONFIG.values()
-        for item in indicators
-    )
+    # Pre-compute cluster max scores for normalization
+    cluster_max = {}
+    for _cat, indicators in FACTOR_CONFIG.items():
+        for item in indicators:
+            cg = item.get('cluster_group', item['ticker'])
+            w3 = item['weight'] * 3
+            if cg not in cluster_max or w3 > cluster_max[cg]:
+                cluster_max[cg] = w3
+    max_possible_score = sum(cluster_max.values()) if cluster_max else 1.0
 
     daily_scores = {}
     for d in sampled_dates:
-        day_total = 0.0
+        # Collect factor scores grouped by cluster
+        cluster_factor_scores = {}
         for _cat, indicators in FACTOR_CONFIG.items():
             for item in indicators:
                 ticker = item['ticker']
@@ -900,7 +753,16 @@ def compute_rolling_scores(historical_data, n_days=50):
                 weight = item['weight']
                 raw = z * weight if item['higher_is_bullish'] else -z * weight
                 factor_score = max(min(raw, weight * 3), -weight * 3)
-                day_total += factor_score
+
+                cg = item.get('cluster_group', ticker)
+                if cg not in cluster_factor_scores:
+                    cluster_factor_scores[cg] = []
+                cluster_factor_scores[cg].append(factor_score)
+
+        # Average within clusters, then sum
+        day_total = sum(
+            np.mean(scores) for scores in cluster_factor_scores.values()
+        )
         if max_possible_score > 0:
             daily_scores[d] = max(min(day_total / max_possible_score, 1.0), -1.0)
 
@@ -999,7 +861,7 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
             # Determine actual data source status
             is_computed_live = ticker in historical_data and not (
                 item['source'] == 'SIMULATED' and ticker not in [
-                    "FEDFUNDS_REAL", "AU_M2", "SI_BETA", "MA_BULL", "RSI_DIV", "BB_EXP"
+                    "FEDFUNDS_REAL", "AU_M2", "SI_BETA"
                 ]
             )
             if item['source'] == 'SIMULATED' and not is_computed_live:
@@ -1015,9 +877,12 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
             entry = {
                 "Category": category,
                 "Indicator": item['ind'],
+                "Cluster Group": item.get('cluster_group', ''),
                 "Definition": item.get('definition', ''),
                 "Ticker / Source": source_label,
                 "Value": stats["Value"],
+                "Change": stats.get("Change", "N/A"),
+                "Change Color": stats.get("Change Color", "gray"),
                 "Sparkline": sparkline_svg,
                 "Colour Indicator": stats["Colour Indicator"],
                 "Total Factor Score": stats["Total Factor Score"],
@@ -1037,19 +902,43 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
     # Fetch market headlines
     headlines = fetch_market_headlines()
 
-# ─── Overall Confidence & Scoring Calculations ───────────────────────────────
+# ─── Overall Confidence & Scoring Calculations (Cluster-Aware) ───────────────
 
-overall_score = final_df['Total Factor Score'].sum()
 total_factors = len(final_df)
 decisive_signals = len(final_df[final_df['Colour Indicator'].isin(['Green', 'Red'])])
 confidence_pct = (decisive_signals / total_factors) * 100 if total_factors > 0 else 0
 
-# Compute maximum possible bullish score: sum of (weight * 3) for every factor
-max_possible_score = sum(
-    item['weight'] * 3
-    for indicators in FACTOR_CONFIG.values()
-    for item in indicators
-)
+# Cluster-aware scoring: average factor scores within each cluster, then sum clusters.
+# This prevents correlated factors (e.g., 4 real-rate measures) from dominating the total.
+if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any():
+    cluster_scores = final_df.groupby('Cluster Group')['Total Factor Score'].mean()
+    overall_score = float(cluster_scores.sum())
+
+    # Max possible per cluster = max(weight*3) of factors in that cluster
+    # (since we average within cluster, the max avg approaches the heaviest factor's max)
+    cluster_max = {}
+    for _, row in final_df.iterrows():
+        cg = row.get('Cluster Group', '')
+        w = 0
+        # Look up the weight from FACTOR_CONFIG
+        for indicators in FACTOR_CONFIG.values():
+            for item in indicators:
+                if item['ind'] == row['Indicator']:
+                    w = item['weight']
+                    break
+        if cg not in cluster_max or w * 3 > cluster_max[cg]:
+            cluster_max[cg] = w * 3
+    max_possible_score = sum(cluster_max.values()) if cluster_max else 1.0
+    num_clusters = len(cluster_scores)
+else:
+    # Fallback: simple sum (no cluster info)
+    overall_score = final_df['Total Factor Score'].sum()
+    max_possible_score = sum(
+        item['weight'] * 3
+        for indicators in FACTOR_CONFIG.values()
+        for item in indicators
+    )
+    num_clusters = total_factors
 
 # Normalized Gold Score: actual / max, bounded [-1.0, +1.0]
 gold_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
@@ -1079,6 +968,23 @@ else:
 
 # ─── Summary Score Panel ─────────────────────────────────────────────────────
 
+# Gold Score change (from rolling_scores)
+if len(rolling_scores) >= 2:
+    score_prev = float(rolling_scores.iloc[-2])
+    score_change = gold_score - score_prev
+    if score_change > 0.0005:
+        score_chg_str = f"▲ +{score_change:.3f}"
+        score_chg_color = "#22c55e"
+    elif score_change < -0.0005:
+        score_chg_str = f"▼ {score_change:.3f}"
+        score_chg_color = "#ef4444"
+    else:
+        score_chg_str = "— 0.000"
+        score_chg_color = "#888"
+else:
+    score_chg_str = "N/A"
+    score_chg_color = "#888"
+
 # Gauge bar: map gold_score from [-1, 1] to [0%, 100%] for the fill
 gauge_pct = (gold_score + 1.0) / 2.0 * 100  # -1 → 0%, 0 → 50%, +1 → 100%
 
@@ -1096,6 +1002,8 @@ _summary_html = (
     f'font-family:\'SF Mono\',\'Fira Code\',monospace;">{gold_score:+.2f}</div>'
     f'<div style="font-size:1.05rem;color:{interp_color};font-weight:600;margin-top:4px;">'
     f'{interp_emoji} {interpretation}</div>'
+    f'<div style="font-size:0.9rem;color:{score_chg_color};font-weight:600;margin-top:6px;'
+    f'font-family:\'SF Mono\',\'Fira Code\',monospace;">{score_chg_str}</div>'
     '<div style="margin-top:8px;">'
     '<div style="font-size:0.65rem;color:#666;margin-bottom:2px;">90-Day Score Trend</div>'
     f'{score_sparkline_svg}'
@@ -1114,6 +1022,8 @@ _summary_html = (
     f'<tr style="border-top:1px solid #333;">'
     f'<td style="padding:6px 0 3px 0;color:#888;">Normalized</td>'
     f'<td style="padding:6px 0 3px 0;text-align:right;font-weight:700;color:{interp_color};font-family:monospace;">{gold_score:+.2f}</td></tr>'
+    f'<tr><td style="padding:3px 0;color:#888;">Last Period Change</td>'
+    f'<td style="padding:3px 0;text-align:right;font-weight:600;color:{score_chg_color};font-family:monospace;">{score_chg_str}</td></tr>'
     '</table></div>'
     # Interpretation scale
     '<div style="flex:0 0 auto;min-width:220px;">'
@@ -1126,7 +1036,7 @@ _summary_html = (
     '<tr><td style="padding:2px 10px 2px 0;color:#22c55e;font-family:monospace;">+0.5 to +1.0</td><td>Strong Bullish</td></tr>'
     '</table>'
     f'<div style="margin-top:12px;font-size:0.75rem;color:#666;">'
-    f'{total_factors} factors &middot; {total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
+    f'{total_factors} factors &middot; {num_clusters} clusters &middot; {total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
     '</div>'
     '</div>'
     # Gauge bar
@@ -1545,6 +1455,9 @@ st.markdown("""
 .factor-table tr:hover {
     background: #1e1e30;
 }
+.factor-table tr:hover td {
+    color: #ffffff !important;
+}
 /* Indicator cell with tooltip */
 .ind-cell {
     position: relative;
@@ -1600,6 +1513,10 @@ st.markdown("""
 .score-neg { color: #ef4444; font-weight: 600; }
 .score-zero { color: #888; }
 .val-cell { font-weight: 600; font-family: 'SF Mono', 'Fira Code', monospace; }
+.chg-cell { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
+.chg-green { color: #22c55e; }
+.chg-red { color: #ef4444; }
+.chg-gray { color: #888; }
 .spark-cell { padding: 4px 6px !important; vertical-align: middle; min-width: 130px; }
 .spark-cell svg { display: block; }
 </style>
@@ -1608,13 +1525,14 @@ st.markdown("""
 
 def render_category_table(cat_df):
     """Render a category table as HTML with hover tooltips on indicator names and sparklines."""
-    cols = ["Indicator", "Ticker / Source", "Value", "Sparkline", "5Y Mean", "Z-Score",
+    cols = ["Indicator", "Ticker / Source", "Value", "Change", "Sparkline", "5Y Mean", "Z-Score",
             "Percentile", "Colour Indicator", "Total Factor Score"]
 
     header_labels = {
         "Colour Indicator": "Signal",
         "Total Factor Score": "Score",
-        "Sparkline": "50D Trend"
+        "Sparkline": "50D Trend",
+        "Change": "Chg"
     }
 
     html = '<table class="factor-table">'
@@ -1626,6 +1544,7 @@ def render_category_table(cat_df):
 
     for _, row in cat_df.iterrows():
         ind_name = row["Indicator"]
+        cluster = row.get("Cluster Group", "")
         definition = row.get("Definition", "")
         why = row.get("Why It Matters", "")
 
@@ -1638,9 +1557,11 @@ def render_category_table(cat_df):
             val = row.get(c, "")
 
             if c == "Indicator":
-                # Indicator cell with tooltip
+                # Indicator cell with tooltip and cluster label
                 html += '<td class="ind-cell">'
                 html += f'<span class="ind-name">{esc(ind_name)}</span>'
+                if cluster:
+                    html += f'<div style="font-size:0.65rem;color:#666;margin-top:1px;">{esc(cluster)}</div>'
                 if definition:
                     html += '<div class="tooltip-box">'
                     html += f'<div class="tt-title">{esc(ind_name)}</div>'
@@ -1649,6 +1570,11 @@ def render_category_table(cat_df):
                         html += f'<div class="tt-why">Why it matters: {esc(why)}</div>'
                     html += '</div>'
                 html += '</td>'
+
+            elif c == "Change":
+                chg_color = row.get("Change Color", "gray")
+                css_class = f"chg-cell chg-{chg_color}"
+                html += f'<td class="{css_class}">{esc(str(val))}</td>'
 
             elif c == "Sparkline":
                 # Insert the pre-built SVG sparkline directly (trusted HTML)
