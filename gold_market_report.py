@@ -89,6 +89,82 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ─── LBMA Analyst Forecast Data ───────────────────────────────────────────────
+# The LBMA Annual Precious Metals Forecast Survey is published each January.
+# 28 named analysts from major banks and consultancies provide low/avg/high
+# gold price forecasts for the year.  We try a live scrape first, then fall
+# back to the hardcoded 2026 survey data (it only changes once per year).
+
+def fetch_analyst_forecasts():
+    """Return list of analyst gold price forecasts for the current survey year.
+    Each entry: {analyst, institution, low, avg, high}.
+    Tries live LBMA scrape first; falls back to hardcoded 2026 survey."""
+
+    # ── Try live scrape ──────────────────────────────────────────────────
+    try:
+        from bs4 import BeautifulSoup
+        resp = requests.get(
+            "https://www.lbma.org.uk/forecast-survey-2026/analysts-forecasts",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; GoldDashboard/1.0)"},
+        )
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = []
+            # LBMA page lists analysts in cards / table rows — parse whatever structure exists
+            for card in soup.select("table tr, .analyst-card, .forecast-row"):
+                cells = card.find_all(["td", "span", "div"])
+                texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
+                if len(texts) >= 5:
+                    # Try to extract: analyst, institution, low, avg, high
+                    try:
+                        name = texts[0]
+                        inst = texts[1]
+                        low = float(texts[2].replace(",", "").replace("$", ""))
+                        avg = float(texts[3].replace(",", "").replace("$", ""))
+                        high = float(texts[4].replace(",", "").replace("$", ""))
+                        if 1000 < avg < 20000:  # sanity check
+                            rows.append({"analyst": name, "institution": inst, "low": low, "avg": avg, "high": high})
+                    except (ValueError, IndexError):
+                        continue
+            if len(rows) >= 10:
+                return sorted(rows, key=lambda r: r["avg"]), 2026
+    except Exception:
+        pass
+
+    # ── Fallback: hardcoded LBMA 2026 Forecast Survey (published Jan 2026) ──
+    data = [
+        {"analyst": "Robin Bhar",           "institution": "Robin Bhar Metals Consulting", "low": 3500, "avg": 4000, "high": 5000},
+        {"analyst": "Bart Melek",           "institution": "TD Securities",               "low": 3920, "avg": 4213, "high": 4775},
+        {"analyst": "Bernard Dahdah",       "institution": "Natixis",                     "low": 3700, "avg": 4250, "high": 4950},
+        {"analyst": "Debajit Saha",         "institution": "Refinitiv Metals Research",   "low": 3700, "avg": 4269, "high": 5175},
+        {"analyst": "Caroline Bain",        "institution": "Bain Commodities",            "low": 3500, "avg": 4299, "high": 4800},
+        {"analyst": "Rhona O'Connell",      "institution": "StoneX Financial",            "low": 3650, "avg": 4380, "high": 4950},
+        {"analyst": "Srivatsava Ganapathy", "institution": "Eventell Global Advisory",    "low": 3600, "avg": 4420, "high": 5250},
+        {"analyst": "Christopher Louney",   "institution": "RBC Capital Markets",         "low": 3704, "avg": 4427, "high": 5108},
+        {"analyst": "Michael Hsueh",        "institution": "Deutsche Bank",               "low": 3950, "avg": 4450, "high": 4950},
+        {"analyst": "Rohit Savant",         "institution": "CPM Group",                   "low": 3975, "avg": 4460, "high": 5000},
+        {"analyst": "Nicky Shiels",         "institution": "MKS PAMP SA",                 "low": 3750, "avg": 4500, "high": 5400},
+        {"analyst": "James Steel",          "institution": "HSBC",                        "low": 3950, "avg": 4586, "high": 5050},
+        {"analyst": "Renisha Chainani",     "institution": "Augmont",                     "low": 3900, "avg": 4600, "high": 5800},
+        {"analyst": "Alexander Zumpfe",     "institution": "Heraeus Metals Germany",      "low": 3450, "avg": 4620, "high": 5200},
+        {"analyst": "Frank Schallenberger", "institution": "LBBW",                        "low": 3809, "avg": 4621, "high": 4872},
+        {"analyst": "Kirill Kirilenko",     "institution": "CRU International",           "low": 4200, "avg": 4650, "high": 5100},
+        {"analyst": "Joni Teves",           "institution": "UBS",                         "low": 4150, "avg": 4675, "high": 5000},
+        {"analyst": "Suki Cooper",          "institution": "Standard Chartered",          "low": 3700, "avg": 4788, "high": 5500},
+        {"analyst": "Kieran Tompkins",      "institution": "Capital Economics",           "low": 4100, "avg": 4800, "high": 5100},
+        {"analyst": "Grant Sporre",         "institution": "Bloomberg Intelligence",      "low": 4025, "avg": 4820, "high": 5280},
+        {"analyst": "Nikos Kavalis",        "institution": "Metals Focus",                "low": 4300, "avg": 4850, "high": 5500},
+        {"analyst": "Chantelle Schieven",   "institution": "Capitalight Research",        "low": 4240, "avg": 5072, "high": 5830},
+        {"analyst": "Jacob Smith",          "institution": "Mitsubishi Corporation",      "low": 3900, "avg": 5100, "high": 5800},
+        {"analyst": "Keisuke Okui",         "institution": "Sumitomo Corporation",        "low": 3500, "avg": 5300, "high": 6000},
+        {"analyst": "Ross Norman",          "institution": "Metals Daily",                "low": 4350, "avg": 5375, "high": 6400},
+        {"analyst": "Bruce Ikemizu",        "institution": "Japan Bullion Market Assoc",  "low": 4200, "avg": 5450, "high": 6200},
+        {"analyst": "Rene Hochreiter",      "institution": "NOAH Capital Markets",        "low": 4352, "avg": 5750, "high": 6300},
+        {"analyst": "Julia Du",             "institution": "ICBC Standard Bank",          "low": 4100, "avg": 6050, "high": 7150},
+    ]
+    return sorted(data, key=lambda r: r["avg"]), 2026
+
 # ─── Factor Configuration (loaded from spreadsheet) ──────────────────────────
 # Config lives in gold_scoring_config.xlsx for easy review and editing.
 # Each factor has: ind, ticker, source, weight, higher_is_bullish,
@@ -1267,56 +1343,44 @@ _summary_html = (
     '</div>'
 )
 
-# ─── Price Predictions & Support/Resistance ──────────────────────────────────
-# Compute from gold price history using technical methods:
-#   Predictions: score-adjusted linear regression extrapolation
-#   Support/Resistance: pivot points from recent high/low/close
+# ─── Analyst Forecasts & Support/Resistance ──────────────────────────────────
 _gc = historical_data.get("GC=F")
 _targets_html = ""
+_analyst_forecasts = []  # store for the expander below
+_forecast_year = 2026
 if _gc is not None and len(_gc) > 200:
     _spot = float(_gc.iloc[-1])
 
-    # --- Price Predictions ---
-    # Blended approach: combine long-term base rate with recent momentum,
-    # tilted by the Gold Score signal. Much more conservative than pure
-    # linear extrapolation.
+    # --- LBMA Analyst Consensus Forecasts ---
+    _analyst_forecasts, _forecast_year = fetch_analyst_forecasts()
+    _n_analysts = len(_analyst_forecasts)
 
-    # 1) Long-term base rate: gold's historical avg annual return ~7-8%
-    _LT_ANNUAL_RETURN = 0.075  # 7.5% annualized base rate
-    _lt_daily = _LT_ANNUAL_RETURN / 252
+    # Compute consensus statistics
+    _all_lows = [a["low"] for a in _analyst_forecasts]
+    _all_avgs = [a["avg"] for a in _analyst_forecasts]
+    _all_highs = [a["high"] for a in _analyst_forecasts]
 
-    # 2) Recent momentum: 60-day regression slope as annualized return
-    _gc_60 = _gc.iloc[-60:].dropna()
-    _x = np.arange(len(_gc_60))
-    _slope, _intercept = np.polyfit(_x, _gc_60.values, 1)
-    _momentum_daily_return = _slope / _spot  # convert $/day to % return/day
+    _consensus_low = min(_all_lows)
+    _consensus_avg = sum(_all_avgs) / _n_analysts
+    _consensus_high = max(_all_highs)
 
-    # 3) Blend: short horizons lean more on momentum, long horizons
-    #    revert toward the long-term base rate (mean reversion)
-    _horizon_blend = {"1W": 0.8, "1M": 0.6, "6M": 0.3, "12M": 0.15}
+    # Find who set the extremes
+    _low_analyst = min(_analyst_forecasts, key=lambda a: a["low"])
+    _high_analyst = max(_analyst_forecasts, key=lambda a: a["high"])
 
-    # 4) Gold Score tilt: score adds/subtracts a fraction of volatility
-    #    to the expected return (not a multiplier). Score of ±1 → ±0.5σ tilt
-    _daily_returns = _gc.pct_change().dropna()
-    _daily_vol = float(_daily_returns.iloc[-60:].std())
-    _ann_vol = _daily_vol * np.sqrt(252)
-    _score_tilt_annual = gold_score * _ann_vol * 0.5  # ±half-sigma
-    _score_tilt_daily = _score_tilt_annual / 252
+    # How many forecast above/below spot
+    _above_spot = sum(1 for a in _analyst_forecasts if a["avg"] > _spot)
+    _below_spot = _n_analysts - _above_spot
 
-    _predictions = {}
-    for _label, _days in [("1W", 5), ("1M", 21), ("6M", 126), ("12M", 252)]:
-        _w = _horizon_blend[_label]
-        # Blended daily return: weighted avg of momentum and long-term base
-        _blended_daily = _w * _momentum_daily_return + (1 - _w) * _lt_daily
-        # Add the score-based tilt
-        _blended_daily += _score_tilt_daily
-        # Compound the return over the horizon
-        _proj = _spot * (1 + _blended_daily) ** _days
-        # Bound by ±1σ of the horizon volatility (tighter than the old ±2σ)
-        _max_move = _spot * _ann_vol * (_days / 252) ** 0.5
-        _proj = max(min(_proj, _spot + _max_move), _spot - _max_move)
-        _pct = (_proj - _spot) / _spot * 100
-        _predictions[_label] = {"price": _proj, "pct": _pct}
+    # % vs spot
+    _low_pct = (_consensus_low - _spot) / _spot * 100
+    _avg_pct = (_consensus_avg - _spot) / _spot * 100
+    _high_pct = (_consensus_high - _spot) / _spot * 100
+
+    def _pct_color(p):
+        return "#22c55e" if p > 0.5 else ("#ef4444" if p < -0.5 else "#facc15")
+    def _pct_arrow(p):
+        return "▲" if p > 0.5 else ("▼" if p < -0.5 else "—")
 
     # --- Support & Resistance (Pivot Points) ---
     # Classic pivot: use prior day's High, Low, Close
@@ -1345,32 +1409,47 @@ if _gc is not None and len(_gc) > 200:
     _targets_html = (
         '<div class="targets-flex">'
 
-        # Price Predictions
+        # Analyst Consensus
         '<div class="targets-col">'
-        '<div class="summary-label" style="margin-bottom:8px;">Price Projections</div>'
+        f'<div class="summary-label" style="margin-bottom:8px;">'
+        f'{_forecast_year} Analyst Consensus ({_n_analysts} Analysts)</div>'
         '<table class="summary-table">'
         '<tr style="border-bottom:1px solid #333;">'
-        '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;">Horizon</th>'
-        '<th style="padding:3px 8px;text-align:right;color:#888;font-weight:600;">Target</th>'
-        '<th style="padding:3px 0;text-align:right;color:#888;font-weight:600;">Chg</th></tr>'
-    )
-    for _label in ["1W", "1M", "6M", "12M"]:
-        _p = _predictions[_label]
-        _pc = _p["pct"]
-        _clr = "#22c55e" if _pc > 0.1 else ("#ef4444" if _pc < -0.1 else "#facc15")
-        _arrow = "▲" if _pc > 0.1 else ("▼" if _pc < -0.1 else "—")
-        _targets_html += (
-            f'<tr style="border-bottom:1px solid #1a1a2e;">'
-            f'<td style="padding:4px 0;color:#aaa;">{_label}</td>'
-            f'<td style="padding:4px 8px;text-align:right;font-family:monospace;font-weight:600;">'
-            f'${_p["price"]:,.0f}</td>'
-            f'<td style="padding:4px 0;text-align:right;font-family:monospace;color:{_clr};">'
-            f'{_arrow} {_pc:+.1f}%</td></tr>'
-        )
-    _targets_html += (
+        '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;"></th>'
+        '<th style="padding:3px 8px;text-align:right;color:#888;font-weight:600;">Price</th>'
+        '<th style="padding:3px 6px;text-align:right;color:#888;font-weight:600;">vs Spot</th>'
+        '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;font-size:0.7rem;">Source</th></tr>'
+
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:4px 0;color:#ef4444;font-weight:600;">Low</td>'
+        f'<td style="padding:4px 8px;text-align:right;font-family:monospace;font-weight:600;">'
+        f'${_consensus_low:,.0f}</td>'
+        f'<td style="padding:4px 6px;text-align:right;font-family:monospace;font-size:0.78rem;color:{_pct_color(_low_pct)};">'
+        f'{_pct_arrow(_low_pct)} {_low_pct:+.1f}%</td>'
+        f'<td style="padding:4px 0;font-size:0.65rem;color:#888;">'
+        f'{_low_analyst["analyst"][:15]}<br><span style="color:#555;">{_low_analyst["institution"][:20]}</span></td></tr>'
+
+        f'<tr style="border-bottom:1px solid #333;background:rgba(255,255,255,0.03);">'
+        f'<td style="padding:5px 0;color:#60a5fa;font-weight:700;">Avg</td>'
+        f'<td style="padding:5px 8px;text-align:right;font-family:monospace;font-weight:700;color:#60a5fa;">'
+        f'${_consensus_avg:,.0f}</td>'
+        f'<td style="padding:5px 6px;text-align:right;font-family:monospace;font-size:0.78rem;color:{_pct_color(_avg_pct)};">'
+        f'{_pct_arrow(_avg_pct)} {_avg_pct:+.1f}%</td>'
+        f'<td style="padding:5px 0;font-size:0.65rem;color:#888;">{_n_analysts} analysts</td></tr>'
+
+        f'<tr style="border-bottom:1px solid #1a1a2e;">'
+        f'<td style="padding:4px 0;color:#22c55e;font-weight:600;">High</td>'
+        f'<td style="padding:4px 8px;text-align:right;font-family:monospace;font-weight:600;">'
+        f'${_consensus_high:,.0f}</td>'
+        f'<td style="padding:4px 6px;text-align:right;font-family:monospace;font-size:0.78rem;color:{_pct_color(_high_pct)};">'
+        f'{_pct_arrow(_high_pct)} {_high_pct:+.1f}%</td>'
+        f'<td style="padding:4px 0;font-size:0.65rem;color:#888;">'
+        f'{_high_analyst["analyst"][:15]}<br><span style="color:#555;">{_high_analyst["institution"][:20]}</span></td></tr>'
+
         '</table>'
         f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
-        f'Based on 60-day trend blended with score tilt (vol: {_ann_vol*100:.0f}% ann.)</div>'
+        f'{_above_spot} of {_n_analysts} forecast above spot (${_spot:,.0f}) '
+        f'&middot; Source: LBMA Forecast Survey {_forecast_year}</div>'
         '</div>'
 
         # Support & Resistance
@@ -1438,6 +1517,57 @@ if fetch_errors:
     with st.expander(f"⚠️ Data Fetch Issues ({len(fetch_errors)})", expanded=False):
         for err in fetch_errors:
             st.text(f"  • {err}")
+
+# ─── Analyst Forecasts Detail Expander ─────────────────────────────────────
+if _analyst_forecasts and _gc is not None and len(_gc) > 200:
+    _spot_for_table = float(_gc.iloc[-1])
+    with st.expander(f"View All {len(_analyst_forecasts)} Analyst Forecasts — LBMA {_forecast_year} Survey", expanded=False):
+        # Build HTML table of all analysts
+        _at_html = (
+            '<div class="factor-table-wrap">'
+            '<table class="factor-table" style="min-width:500px;">'
+            '<tr>'
+            '<th style="padding:6px 8px;">Analyst</th>'
+            '<th style="padding:6px 8px;">Institution</th>'
+            '<th style="padding:6px 8px;text-align:right;">Low</th>'
+            '<th style="padding:6px 8px;text-align:right;">Average</th>'
+            '<th style="padding:6px 8px;text-align:right;">High</th>'
+            '<th style="padding:6px 8px;text-align:right;">vs Spot</th>'
+            '</tr>'
+        )
+        _above_count = 0
+        for _af in _analyst_forecasts:
+            _vs = (_af["avg"] - _spot_for_table) / _spot_for_table * 100
+            _vs_clr = "#22c55e" if _vs > 0.5 else ("#ef4444" if _vs < -0.5 else "#facc15")
+            _vs_arrow = "▲" if _vs > 0.5 else ("▼" if _vs < -0.5 else "—")
+            # Highlight if spot is within analyst's range
+            _in_range = _af["low"] <= _spot_for_table <= _af["high"]
+            _row_bg = "background:rgba(96,165,250,0.06);" if _in_range else ""
+            if _af["avg"] > _spot_for_table:
+                _above_count += 1
+            _at_html += (
+                f'<tr style="{_row_bg}">'
+                f'<td style="padding:5px 8px;font-weight:500;color:#d0d0d0;">{_af["analyst"]}</td>'
+                f'<td style="padding:5px 8px;color:#888;font-size:0.8rem;">{_af["institution"]}</td>'
+                f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:#ef4444;">${_af["low"]:,.0f}</td>'
+                f'<td style="padding:5px 8px;text-align:right;font-family:monospace;font-weight:600;color:#60a5fa;">${_af["avg"]:,.0f}</td>'
+                f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:#22c55e;">${_af["high"]:,.0f}</td>'
+                f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:{_vs_clr};">'
+                f'{_vs_arrow} {_vs:+.1f}%</td>'
+                '</tr>'
+            )
+        _at_html += (
+            '</table></div>'
+            f'<div style="margin-top:10px;font-size:0.78rem;color:#888;">'
+            f'<b>{_above_count}</b> of {len(_analyst_forecasts)} analysts forecast an average above current spot '
+            f'(${_spot_for_table:,.0f}). '
+            f'Rows highlighted in blue indicate spot price falls within the analyst\'s low-high range.'
+            f'</div>'
+            f'<div style="margin-top:6px;font-size:0.65rem;color:#555;">'
+            f'Source: LBMA Annual Precious Metals Forecast Survey {_forecast_year}. '
+            f'Sorted by average forecast ascending.</div>'
+        )
+        st.markdown(_at_html, unsafe_allow_html=True)
 
 # ─── Spot Prices Panel ──────────────────────────────────────────────────────
 st.subheader("Spot Precious Metals Prices")
