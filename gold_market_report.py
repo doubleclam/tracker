@@ -322,6 +322,22 @@ def fetch_historical_data():
             else:
                 fetch_errors.append(f"YF {t}: not in downloaded columns")
 
+        # Retry failed crypto tickers individually (batch download often returns NaN for crypto)
+        crypto_tickers = [t for t in ["BTC-USD"] if t not in hist_data]
+        for t in crypto_tickers:
+            try:
+                solo_df = yf.download(t, start=start_date, end=end_date, progress=False)
+                if isinstance(solo_df.columns, pd.MultiIndex):
+                    s = solo_df["Close"][t].dropna()
+                else:
+                    s = solo_df["Close"].dropna()
+                if len(s) > 0:
+                    hist_data[t] = s
+                    # Remove the earlier error since we recovered
+                    fetch_errors[:] = [e for e in fetch_errors if t not in e]
+            except Exception:
+                pass
+
         # Compute Ratios dynamically
         ratio_pairs = {
             "GC=F/SI=F": ("GC=F", "SI=F"),
