@@ -464,7 +464,7 @@ def fetch_historical_data():
 
     # 2. Fetch Yahoo Finance Data (now includes FX pairs for gold-in-other-currencies)
     yf_tickers = [
-        "DX-Y.NYB", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
+        "DX=F", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
         "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ",
         "PA=F", "HG=F", "^SKEW",
         "EUR=X", "GBPUSD=X", "JPY=X", "CNY=X"
@@ -982,27 +982,31 @@ def compute_rolling_scores(historical_data, n_days=50):
     if len(sampled_dates) < 3:
         sampled_dates = date_range
 
-    # Pre-compute cluster max scores for normalization
-    cluster_max = {}
+    # Pre-compute cluster max weights for weighted normalization
+    cluster_max_weight = {}
+    cluster_factor_weights = {}  # {cluster: {ticker: weight}}
     for _cat, indicators in FACTOR_CONFIG.items():
         for item in indicators:
             cg = item.get('cluster_group', item['ticker'])
-            w3 = item['weight'] * 3
-            if cg not in cluster_max or w3 > cluster_max[cg]:
-                cluster_max[cg] = w3
-    max_possible_score = sum(cluster_max.values()) if cluster_max else 1.0
+            w = item['weight']
+            if cg not in cluster_max_weight or w > cluster_max_weight[cg]:
+                cluster_max_weight[cg] = w
+            if cg not in cluster_factor_weights:
+                cluster_factor_weights[cg] = {}
+            cluster_factor_weights[cg][item['ticker']] = w
+    # max contribution per cluster = max_w * max_w * 3 (matching main scoring)
+    max_possible_score = sum(mw * mw * 3 for mw in cluster_max_weight.values()) if cluster_max_weight else 1.0
 
     daily_scores = {}
     for d in sampled_dates:
-        # Collect factor scores grouped by cluster
-        cluster_factor_scores = {}
+        # Collect factor scores grouped by cluster with weights
+        cluster_factor_data = {}  # {cluster: [(score, weight), ...]}
         for _cat, indicators in FACTOR_CONFIG.items():
             for item in indicators:
                 ticker = item['ticker']
                 series = historical_data.get(ticker)
                 if series is None or len(series) < 10:
                     continue
-                # Use data up to day d
                 s_up_to = series[series.index <= d]
                 if len(s_up_to) < 10:
                     continue
@@ -1017,14 +1021,21 @@ def compute_rolling_scores(historical_data, n_days=50):
                 factor_score = max(min(raw, weight * 3), -weight * 3)
 
                 cg = item.get('cluster_group', ticker)
-                if cg not in cluster_factor_scores:
-                    cluster_factor_scores[cg] = []
-                cluster_factor_scores[cg].append(factor_score)
+                if cg not in cluster_factor_data:
+                    cluster_factor_data[cg] = []
+                cluster_factor_data[cg].append((factor_score, weight))
 
-        # Average within clusters, then sum
-        day_total = sum(
-            np.mean(scores) for scores in cluster_factor_scores.values()
-        )
+        # Weighted average within clusters, then weight by max_weight
+        day_total = 0.0
+        for cg, items in cluster_factor_data.items():
+            w_sum = sum(w for _, w in items)
+            if w_sum > 0:
+                w_avg = sum(s * w for s, w in items) / w_sum
+            else:
+                w_avg = 0.0
+            mw = cluster_max_weight.get(cg, 1)
+            day_total += w_avg * mw
+
         if max_possible_score > 0:
             daily_scores[d] = max(min(day_total / max_possible_score, 1.0), -1.0)
 
@@ -1219,28 +1230,72 @@ total_factors = len(final_df)
 decisive_signals = len(final_df[final_df['Colour Indicator'].isin(['Green', 'Red'])])
 confidence_pct = (decisive_signals / total_factors) * 100 if total_factors > 0 else 0
 
-# Cluster-aware scoring: average factor scores within each cluster, then sum clusters.
-# This prevents correlated factors (e.g., 4 real-rate measures) from dominating the total.
-if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any():
-    cluster_scores = final_df.groupby('Cluster Group')['Total Factor Score'].mean()
-    overall_score = float(cluster_scores.sum())
+# Cluster-aware scoring: weighted average within clusters, then weighted sum across.
+# Each cluster's contribution is scaled by its max weight so macro clusters dominate.
+# Build weight lookup
+_weight_lookup = {}
+for indicators in FACTOR_CONFIG.values():
+    for item in indicators:
+        _weight_lookup[item['ind']] = item['weight']
 
-    # Max possible per cluster = max(weight*3) of factors in that cluster
-    cluster_max = {}
+if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any():
+    # For each cluster: compute weighted average of factor scores, and track max weight
+    cluster_data = {}  # {cluster: {'weighted_sum': float, 'weight_sum': float, 'max_weight': float}}
     for _, row in final_df.iterrows():
-        cg = row.get('Cluster Group', '')
-        w = 0
-        for indicators in FACTOR_CONFIG.values():
-            for item in indicators:
-                if item['ind'] == row['Indicator']:
-                    w = item['weight']
-                    break
-        if cg not in cluster_max or w * 3 > cluster_max[cg]:
-            cluster_max[cg] = w * 3
-    max_possible_score = sum(cluster_max.values()) if cluster_max else 1.0
-    num_clusters = len(cluster_scores)
+        cg = row.get('Cluster Group', row['Indicator'])
+        w = _weight_lookup.get(row['Indicator'], 1)
+        fs = row['Total Factor Score']
+        if cg not in cluster_data:
+            cluster_data[cg] = {'weighted_sum': 0.0, 'weight_sum': 0.0, 'max_weight': 0}
+        cluster_data[cg]['weighted_sum'] += fs * w  # weight the score by its own weight
+        cluster_data[cg]['weight_sum'] += w
+        cluster_data[cg]['max_weight'] = max(cluster_data[cg]['max_weight'], w)
+
+    # Each cluster gets a normalized score in [-3, +3] (since factor_score is capped at w*3)
+    # Then we weight each cluster by its max_weight for the final sum
+    cluster_weighted_scores = {}
+    cluster_max_contributions = {}
+    for cg, cd in cluster_data.items():
+        # Weighted average score for cluster (if all factors maxed at +3*w, this = 3*w)
+        if cd['weight_sum'] > 0:
+            cluster_avg = cd['weighted_sum'] / cd['weight_sum']
+        else:
+            cluster_avg = 0.0
+        # Scale by max weight: high-weight clusters pull the total more
+        mw = cd['max_weight']
+        cluster_weighted_scores[cg] = cluster_avg * mw
+        cluster_max_contributions[cg] = mw * mw * 3  # max contribution = max_w * (max_w * 3)
+
+    overall_score = sum(cluster_weighted_scores.values())
+    max_possible_score = sum(cluster_max_contributions.values()) if cluster_max_contributions else 1.0
+    num_clusters = len(cluster_data)
+
+    # Compute each factor's contribution to the overall score
+    # contribution = (fs × w / cluster_weight_sum) × cluster_max_weight
+    _factor_overall_contrib = {}
+    for _, row in final_df.iterrows():
+        cg = row.get('Cluster Group', row['Indicator'])
+        w = _weight_lookup.get(row['Indicator'], 1)
+        fs = row['Total Factor Score']
+        cd = cluster_data.get(cg, {})
+        ws = cd.get('weight_sum', 1)
+        mw = cd.get('max_weight', w)
+        contrib = (fs * w / ws) * mw if ws > 0 else 0.0
+        _factor_overall_contrib[row['Indicator']] = contrib
+    final_df['Overall Contribution'] = final_df['Indicator'].map(_factor_overall_contrib).fillna(0.0)
+
+    # Store breakdown for display
+    cluster_breakdown = {}
+    for cg, cd in cluster_data.items():
+        mw = cd['max_weight']
+        cluster_breakdown[cg] = {
+            'score': cluster_weighted_scores[cg],
+            'max': cluster_max_contributions[cg],
+            'pct': cluster_weighted_scores[cg] / max_possible_score * 100 if max_possible_score > 0 else 0,
+            'max_weight': mw,
+        }
 else:
-    # Fallback: simple sum (no cluster info)
+    # Fallback: simple weighted sum
     overall_score = final_df['Total Factor Score'].sum()
     max_possible_score = sum(
         item['weight'] * 3
@@ -1248,6 +1303,45 @@ else:
         for item in indicators
     )
     num_clusters = total_factors
+    cluster_breakdown = {}
+    final_df['Overall Contribution'] = final_df['Total Factor Score']
+
+# Compute previous-day cluster scores for daily change column
+_prev_cluster_scores = {}
+if cluster_breakdown:
+    for _cat, indicators in FACTOR_CONFIG.items():
+        for item in indicators:
+            ticker = item['ticker']
+            series = historical_data.get(ticker)
+            if series is None or len(series) < 12:
+                continue
+            # Use second-to-last value as "previous day"
+            prev_series = series.iloc[:-1]
+            if len(prev_series) < 10:
+                continue
+            prev_val = float(prev_series.iloc[-1])
+            prev_mean = float(prev_series.mean())
+            prev_std = float(prev_series.std())
+            if prev_std == 0:
+                continue
+            z = (prev_val - prev_mean) / prev_std
+            w = item['weight']
+            raw = z * w if item['higher_is_bullish'] else -z * w
+            fs = max(min(raw, w * 3), -w * 3)
+            cg = item.get('cluster_group', ticker)
+            if cg not in _prev_cluster_scores:
+                _prev_cluster_scores[cg] = {'weighted_sum': 0.0, 'weight_sum': 0.0, 'max_weight': 0}
+            _prev_cluster_scores[cg]['weighted_sum'] += fs * w
+            _prev_cluster_scores[cg]['weight_sum'] += w
+            _prev_cluster_scores[cg]['max_weight'] = max(_prev_cluster_scores[cg]['max_weight'], w)
+    # Convert to final scores matching current methodology
+    for cg, cd in _prev_cluster_scores.items():
+        if cd['weight_sum'] > 0:
+            avg = cd['weighted_sum'] / cd['weight_sum']
+        else:
+            avg = 0.0
+        mw = cd['max_weight']
+        _prev_cluster_scores[cg] = avg * mw  # same as current: cluster_avg * max_weight
 
 # Normalized Gold Score: actual / max, bounded [-1.0, +1.0]
 gold_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
@@ -1315,22 +1409,21 @@ _summary_html = (
     f'{score_sparkline_svg}'
     '</div>'
     '</div>'
-    # Score breakdown
+    # Score breakdown — show top cluster contributions
     '<div class="summary-breakdown">'
     '<div class="summary-label" style="margin-bottom:10px;">Score Breakdown</div>'
     '<table class="summary-table">'
-    f'<tr><td>Total Weighted Score</td>'
+    f'<tr><td>Weighted Score</td>'
     f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td></tr>'
-    f'<tr><td>Max Possible Bullish</td>'
-    f'<td class="summary-td-right">{max_possible_score:.0f}</td></tr>'
-    f'<tr><td>Max Possible Bearish</td>'
-    f'<td class="summary-td-right">-{max_possible_score:.0f}</td></tr>'
+    f'<tr><td>Max Possible</td>'
+    f'<td class="summary-td-right">±{max_possible_score:.0f}</td></tr>'
     f'<tr style="border-top:1px solid #333;">'
     f'<td style="padding-top:6px;">Normalized</td>'
     f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{interp_color};">{gold_score:+.2f}</td></tr>'
-    f'<tr><td>Last Period Change</td>'
+    f'<tr><td>Last Period Δ</td>'
     f'<td class="summary-td-right" style="font-weight:600;color:{score_chg_color};">{score_chg_str}</td></tr>'
-    '</table></div>'
+    '</table>'
+    '</div>'
     '</div>'
 )
 
@@ -1508,6 +1601,148 @@ if fetch_errors:
     with st.expander(f"⚠️ Data Fetch Issues ({len(fetch_errors)})", expanded=False):
         for err in fetch_errors:
             st.text(f"  • {err}")
+
+# ─── Score Calculation Detail Expander ─────────────────────────────────────
+# Cluster descriptions for hover tooltips — explain how each cluster impacts gold
+_CLUSTER_DESCRIPTIONS = {
+    "Real Rates": "THE dominant driver of gold. When real interest rates (nominal yield minus inflation) are low or negative, the opportunity cost of holding non-yielding gold drops to zero — making it attractive vs bonds. Deeply negative real rates (like 2020-2022) have historically produced the strongest gold bull markets. Currently tracking 10Y TIPS, 5Y TIPS, Fed Funds real rate, and a GDP-weighted global composite.",
+    "Dollar Strength": "Gold is priced in USD globally, so a weaker dollar mechanically lifts gold in other currencies and boosts international demand. The DXY index captures the dollar's strength against major trading partners. A falling DXY is one of the most reliable bullish catalysts for gold — the correlation is roughly -0.8 over long periods.",
+    "Global Liquidity": "When central banks expand money supply (M2), more fiat currency chases the same amount of gold. M2 growth acts as a long-term secular driver — gold tends to track global M2 expansion over decades. Rapid M2 growth (like 2020's 25% surge) signals currency debasement that historically precedes gold rallies.",
+    "Fiscal & Debt": "Unsustainable government debt levels (US debt/GDP >120%) and persistent fiscal deficits imply future monetization — the government will eventually need to inflate away its obligations. Rising debt service costs (interest payments) force central banks toward financial repression (keeping rates below inflation), which is structurally bullish for gold.",
+    "Central Bank Buying": "Central banks (especially China, India, Poland, Turkey) have been net buyers since 2010, purchasing 1,000+ tonnes/year recently. This creates a structural price floor. Central bank buying is a slow-moving but powerful signal — it reflects de-dollarization and reserve diversification trends that take years to play out.",
+    "Inflation Expectations": "Gold is traditionally an inflation hedge. When markets expect higher future inflation (via breakevens, consumer surveys, or nowcasts), gold becomes more attractive as a store of value. The 5Y breakeven, UMich consumer expectations, and Cleveland Fed nowcast capture different dimensions of inflation sentiment.",
+    "Yield Curve": "A steepening yield curve (long rates rising faster than short rates) often signals economic normalization or inflation expectations building. For gold, an inverted curve signals recession risk (bullish for safe havens), while steepening can signal inflation expectations (also bullish). The curve's shape reflects the market's macro outlook.",
+    "Credit Spreads": "Widening high-yield credit spreads signal rising systemic risk and fear in financial markets. When corporate bond spreads blow out, it signals stress that typically drives safe-haven flows into gold. Tight spreads indicate complacency — fewer reasons to hold gold as insurance.",
+    "COT Positioning": "CFTC Commitments of Traders data shows who's long and short gold futures. Extremely crowded managed-money longs signal exhaustion (bearish contrarian signal). Swap dealer positioning reflects 'smart money' commercial hedging. Open interest tracks total speculative participation — rising OI with rising price confirms trend strength.",
+    "Physical Demand Asia": "China and India account for ~50% of global gold demand. The Shanghai premium (price over London) directly measures Chinese physical appetite. Indian demand is seasonal (wedding/festival season Oct-Feb). When Asian physical demand is strong, it provides a consumption floor that supports prices.",
+    "Fed Liquidity": "The Fed's balance sheet operations directly impact liquidity. Reverse repo facility usage drains excess cash from the system (bearish for gold). Commercial bank reserves measure base money availability. When the Fed is injecting liquidity (QE), gold benefits from the expanding monetary base.",
+    "Geopolitical Risk": "Gold is the ultimate safe-haven asset during geopolitical crises — wars, sanctions, political instability. The GPR index captures news-based geopolitical tension. While spikes can be sharp, geopolitical premiums tend to fade unless they escalate into sustained economic disruption.",
+    "Moving Averages": "Price above both the 50-day and 200-day moving averages confirms a bullish trend. A 'golden cross' (50D crossing above 200D) is a classic technical buy signal. This is a trend-following indicator — it won't catch bottoms but confirms momentum.",
+    "ETF & Retail Physical": "GLD and other gold ETF flows track institutional/retail accumulation. US Mint coin sales proxy grassroots physical demand. Retail premiums over spot indicate dealer supply constraints. Strong ETF inflows + high physical premiums = broad-based demand across investor types.",
+    "Gold Ratios": "Relative value metrics compare gold to other assets. Gold/Silver ratio above 80 historically reverts (silver catches up). Gold vs Bitcoin tracks competition for 'digital gold' narrative. Gold as % of global financial assets shows allocation room — currently ~1-2% vs historical peaks of 5%+.",
+    "Volatility": "VIX spikes (equity fear) trigger safe-haven capital flight into gold. Gold's own volatility (GVZ) rising signals uncertainty. The combination of high equity vol + low gold vol is the ideal setup — it means gold hasn't moved yet but fear is building.",
+    "Futures Structure": "Backwardation (near-month futures > far-month) indicates tight physical supply — the market is willing to pay a premium for immediate delivery. Contango is normal. Persistent backwardation is a powerful bullish signal for physical gold.",
+    "Mining Fundamentals": "All-in sustaining costs (AISC ~$1,300/oz) create a price floor — miners shut down below this. Mine supply is flat/declining globally (peak gold thesis). Capex underinvestment since 2013 means limited new supply coming online. Reserve depletion forces miners to pay up for acquisitions.",
+    "Banking Stress": "TED spread and SOFR-OIS spread measure interbank lending stress. When banks don't trust each other (spreads widen), it signals systemic risk that drives safe-haven demand. These spiked during 2008, 2020, and the 2023 SVB crisis — each time gold rallied.",
+    "Basel III": "Basel III NSFR rules reclassified unallocated gold from Tier 1 to Tier 3, requiring banks to hold more capital against gold positions. This structurally reduces paper gold supply and may tighten the physical market over time. A slow-burning regulatory tailwind.",
+    "COMEX Inventory": "COMEX registered and eligible gold stocks track the deliverable supply backing futures contracts. Falling inventories signal physical tightness — fewer ounces available to settle contracts. When COMEX stocks plunge (as in early 2022), it can trigger short squeezes.",
+    "Mining Equities": "Gold miners (GDX) typically lead the metal — when miners outperform gold, it signals the market expects higher gold prices. Junior miners (GDXJ) outperforming seniors signals risk-on appetite within the precious metals sector. Miners lagging metal = bearish divergence.",
+    "Lease Rates": "Gold lease rates reflect the cost of borrowing physical gold. Rising lease rates signal physical market stress — someone urgently needs to borrow gold (possibly to cover short positions or deliver on contracts). Spikes in lease rates have preceded major gold rallies.",
+    "EFP Spread": "The Exchange for Physical spread measures the gap between COMEX futures and London spot. A wide EFP signals dislocation between paper and physical markets — arbitrageurs can't close the gap, indicating supply chain stress. This spiked dramatically during COVID.",
+    "Bollinger Bands": "When price trades above the upper Bollinger Band (2 standard deviations above 20-day MA), gold is in an extended move. While this can signal overbought conditions, sustained upper-band riding indicates strong trend momentum. Below lower band = oversold bounce potential.",
+    "RSI": "The Relative Strength Index measures momentum on a 0-100 scale. RSI above 70 = overbought (pullback risk), below 30 = oversold (bounce potential). RSI divergences (price making new highs while RSI doesn't) signal weakening momentum before reversals.",
+    "Options Skew": "Options skew measures the relative cost of call vs put options. Heavy call skew (calls much pricier than puts) implies the market is over-positioned for upside — often a contrarian bearish signal. Put skew indicates hedging demand / fear.",
+    "Silver Beta": "Silver has higher beta to gold — it moves more in both directions. When silver outperforms gold (falling gold/silver ratio), it confirms a broad precious metals bull market. Silver lagging while gold rises suggests the rally lacks breadth.",
+    "Jewelry Demand": "Jewelry accounts for ~50% of annual gold demand by volume but is price-sensitive — demand falls when gold gets expensive. It provides a consumption floor at lower prices. Less impactful on price direction than investment demand but stabilizes the market.",
+    "Dealer Gamma": "Market makers' options gamma exposure affects short-term volatility. Negative gamma means dealers must sell into declines and buy into rallies (amplifying moves). Positive gamma means they dampen moves. This is a short-term flow indicator, not directional.",
+    "Retail Sentiment": "Google Trends for 'buy gold' captures retail search interest. Extremely high search volume often marks local tops (everyone who wanted to buy already has). Low search volume near price lows can signal capitulation. A contrarian indicator at extremes.",
+    "Scrap Supply": "When gold prices are high, recycling/scrap flows increase as people sell old jewelry. This additional supply can cap price rallies. Scrap supply is price-responsive — it acts as a natural dampener on runaway bull moves.",
+    "Sovereign Risk": "US CDS spreads measure the market's perceived probability of US government default. Rising sovereign risk undermines confidence in government bonds, making gold more attractive as a non-sovereign store of value. Spikes during debt ceiling crises boost gold.",
+    "Volume Profile": "Trading volume at specific price levels identifies support and resistance zones. High volume at a price level means many positions were established there — creating a 'memory' that acts as support/resistance when price returns. A structural indicator.",
+    "Ad Spending": "Gold advertising spending (TV, digital) tends to spike during late-cycle retail mania — companies advertise more when they know retail demand is hot. This is a contrarian indicator: heavy gold ads = late-stage euphoria, often preceding corrections.",
+}
+
+if cluster_breakdown:
+    # Sort clusters by absolute contribution (largest impact first)
+    _sorted_clusters = sorted(cluster_breakdown.items(), key=lambda x: abs(x[1]['score']), reverse=True)
+    _max_abs_score = max(abs(c['score']) for c in cluster_breakdown.values()) if cluster_breakdown else 1
+    _cb_rows = ""
+    for _cg_name, _cb in _sorted_clusters:
+        _cb_score = _cb['score']
+        _cb_max = _cb['max']
+        _cb_mw = _cb['max_weight']
+        _norm = _cb_score / _cb_max if _cb_max > 0 else 0
+        if _cb_score > 0.5:
+            _cb_color = "#22c55e"
+            _cb_dir = "Bullish"
+        elif _cb_score < -0.5:
+            _cb_color = "#ef4444"
+            _cb_dir = "Bearish"
+        else:
+            _cb_color = "#facc15"
+            _cb_dir = "Neutral"
+        # Bar: proportional to score relative to largest cluster
+        _bar_pct = (abs(_cb_score) / _max_abs_score * 100) if _max_abs_score > 0 else 0
+        _bar_pct = max(min(_bar_pct, 100), 1)
+        _bar_html = f'<div style="display:flex;align-items:center;gap:4px;"><div style="width:{_bar_pct:.0f}%;height:10px;background:{_cb_color};border-radius:2px;min-width:2px;"></div><span style="font-size:0.7rem;color:#888;">{_cb_score:+.1f}</span></div>'
+        # Daily change
+        _prev_score = _prev_cluster_scores.get(_cg_name, _cb_score)
+        _daily_chg = _cb_score - _prev_score if isinstance(_prev_score, (int, float)) else 0.0
+        if _daily_chg > 0.05:
+            _chg_str = f'<span style="color:#22c55e;">▲ {_daily_chg:+.1f}</span>'
+        elif _daily_chg < -0.05:
+            _chg_str = f'<span style="color:#ef4444;">▼ {_daily_chg:+.1f}</span>'
+        else:
+            _chg_str = f'<span style="color:#666;">— 0.0</span>'
+        # CSS tooltip description
+        _tooltip_text = _CLUSTER_DESCRIPTIONS.get(_cg_name, "No description available.")
+        _tooltip_text_escaped = _tooltip_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        _cb_rows += (
+            f'<tr class="cluster-row">'
+            f'<td style="padding:4px 6px;font-size:0.78rem;position:relative;">'
+            f'<span class="cluster-name">{_cg_name}'
+            f'<span class="cluster-tooltip">{_tooltip_text_escaped}</span>'
+            f'</span></td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:center;">{_cb_mw:.0f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_color};font-weight:600;">{_cb_score:+.1f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;">{_cb_max:.0f}</td>'
+            f'<td style="padding:4px 6px;width:25%;">{_bar_html}</td>'
+            f'<td style="padding:4px 6px;font-size:0.75rem;text-align:center;font-weight:600;">{_chg_str}</td>'
+            f'<td style="padding:4px 6px;font-size:0.75rem;text-align:center;color:{_cb_color};">{_cb_dir}</td>'
+            f'</tr>'
+        )
+    # Compute total daily change
+    _total_daily_chg = overall_score - sum(_prev_cluster_scores.get(cg, cb['score']) for cg, cb in cluster_breakdown.items() if isinstance(_prev_cluster_scores.get(cg, cb['score']), (int, float)))
+    if _total_daily_chg > 0.05:
+        _total_chg_str = f'<span style="color:#22c55e;">▲ {_total_daily_chg:+.1f}</span>'
+    elif _total_daily_chg < -0.05:
+        _total_chg_str = f'<span style="color:#ef4444;">▼ {_total_daily_chg:+.1f}</span>'
+    else:
+        _total_chg_str = f'<span style="color:#666;">— 0.0</span>'
+
+    _calc_html = (
+        '<style>'
+        '.cluster-name { cursor: help; text-decoration: underline dotted #555; text-underline-offset: 3px; position: relative; display: inline-block; }'
+        '.cluster-tooltip { visibility: hidden; opacity: 0; position: absolute; left: 0; top: 100%; z-index: 9999; '
+        'background: #1a1a2e; color: #ccc; padding: 10px 14px; border-radius: 8px; font-size: 0.75rem; '
+        'line-height: 1.5; width: 380px; max-width: 90vw; box-shadow: 0 4px 20px rgba(0,0,0,0.5); '
+        'border: 1px solid #333; pointer-events: none; transition: opacity 0.15s; white-space: normal; '
+        'font-weight: normal; text-decoration: none; }'
+        '.cluster-name:hover .cluster-tooltip { visibility: visible; opacity: 1; }'
+        '.cluster-row:hover { background: #1e1e30; }'
+        '</style>'
+        '<div style="padding:8px 0;">'
+        '<div style="font-size:0.82rem;color:#aaa;margin-bottom:12px;line-height:1.5;">'
+        '<b>Scoring Formula:</b> For each factor: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">raw = z_score × weight</code> '
+        '(flipped for bearish-when-high). Capped at <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">±weight×3</code>. '
+        'Within each cluster, scores are <b>weight-averaged</b>. Then each cluster contributes '
+        '<code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">cluster_avg × max_weight</code> to the total. '
+        f'Final: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{overall_score:+.1f} / {max_possible_score:.0f} = {gold_score:+.3f}</code>'
+        '</div>'
+        '<table class="factor-table" style="table-layout:auto;">'
+        '<tr>'
+        '<th style="padding:5px 6px;text-align:left;">Cluster</th>'
+        '<th style="padding:5px 6px;text-align:center;">Wt</th>'
+        '<th style="padding:5px 6px;text-align:right;">Score</th>'
+        '<th style="padding:5px 6px;text-align:right;">Max</th>'
+        '<th style="padding:5px 6px;text-align:left;">Contribution</th>'
+        '<th style="padding:5px 6px;text-align:center;">Δ Day</th>'
+        '<th style="padding:5px 6px;text-align:center;">Signal</th>'
+        '</tr>'
+        f'{_cb_rows}'
+        '<tr style="border-top:2px solid #444;">'
+        f'<td style="padding:6px;font-weight:700;">TOTAL</td>'
+        f'<td></td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;color:{interp_color};">{overall_score:+.1f}</td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;">{max_possible_score:.0f}</td>'
+        f'<td style="padding:6px;font-weight:700;color:{interp_color};">= {gold_score:+.3f}</td>'
+        f'<td style="padding:6px;text-align:center;font-weight:600;">{_total_chg_str}</td>'
+        f'<td style="padding:6px;text-align:center;font-weight:700;color:{interp_color};">{interpretation}</td>'
+        '</tr>'
+        '</table></div>'
+    )
+    with st.expander(f"📊 Score Calculation — {num_clusters} clusters, {total_factors} factors → {gold_score:+.3f}", expanded=False):
+        st.markdown(_calc_html, unsafe_allow_html=True)
 
 # ─── Analyst Forecasts Detail Expander ─────────────────────────────────────
 if _analyst_forecasts and _gc is not None and len(_gc) > 200:
@@ -2433,11 +2668,11 @@ st.markdown("""
 def render_category_table(cat_df):
     """Render a category table as HTML with hover tooltips on indicator names and sparklines."""
     cols = ["Indicator", "Ticker / Source", "Value", "Change", "Sparkline", "5Y Mean", "Z-Score",
-            "Percentile", "Colour Indicator", "Total Factor Score"]
+            "Percentile", "Colour Indicator", "Overall Contribution"]
 
     header_labels = {
         "Colour Indicator": "Signal",
-        "Total Factor Score": "Score",
+        "Overall Contribution": "Score",
         "Sparkline": "50D Trend",
         "Change": "Chg"
     }
@@ -2496,7 +2731,7 @@ def render_category_table(cat_df):
                 label = {"Green": "▲ Bull", "Red": "▼ Bear", "Yellow": "● Neut"}.get(val, val)
                 html += f'<td class="{css}">{label}</td>'
 
-            elif c == "Total Factor Score":
+            elif c == "Overall Contribution":
                 fval = float(val) if val != "N/A" else 0
                 css = "score-pos" if fval > 0 else ("score-neg" if fval < 0 else "score-zero")
                 html += f'<td class="{css}">{fval:+.1f}</td>'
@@ -2533,7 +2768,7 @@ def render_category_table(cat_df):
 for cat in final_df['Category'].unique():
     cat_df = final_df[final_df['Category'] == cat]
 
-    subset_score = cat_df['Total Factor Score'].sum()
+    subset_score = cat_df['Overall Contribution'].sum()
     c_color = "🟢" if subset_score > 0 else ("🔴" if subset_score < 0 else "🟡")
 
     st.subheader(f"{cat}  {c_color} (Subset Score: {subset_score:.1f})")
