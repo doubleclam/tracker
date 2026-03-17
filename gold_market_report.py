@@ -307,6 +307,8 @@ def fetch_historical_data():
             "DGS10", "CPIAUCSL", "EXPINF1YR",
             "IRLTLT01DEM156N", "IRLTLT01JPM156N", "IRLTLT01GBM156N",
             "DEUCPIALLMINMEI", "JPNCPIALLMINMEI", "GBRCPIALLMINMEI",
+            # Euro area and OIS proxy series
+            "REAINTRATREARAT1YE", "DPCREDIT",
         ]
         for t in fred_tickers:
             try:
@@ -467,7 +469,8 @@ def fetch_historical_data():
         "DX=F", "^VIX", "GC=F", "SI=F", "PL=F", "CL=F",
         "^GSPC", "BTC-USD", "VNQ", "GDX", "GLD", "GDXJ",
         "PA=F", "HG=F", "^SKEW",
-        "EUR=X", "GBPUSD=X", "JPY=X", "CNY=X"
+        "EUR=X", "GBPUSD=X", "JPY=X", "CNY=X",
+        # GCM=F removed — Yahoo Finance doesn't carry a rolling second-month gold futures ticker
     ]
     try:
         yf_df = yf.download(yf_tickers, start=start_date, end=end_date, progress=False)
@@ -735,6 +738,24 @@ def fetch_historical_data():
             except Exception as e:
                 fetch_errors.append(f"LEASE_RATE calc: {e}")
 
+        # FUT_CURVE uses GLD-proxy basis computed above (GCM=F not available on YF)
+
+        # ── AISC proxy: GDX/GC=F ratio scaled to $/oz range ──
+        # When miners outperform gold, margins are expanding (AISC low relative to price).
+        # We scale so that the series sits in a $1000-2000 range similar to actual AISC.
+        if "GDX" in hist_data and "GC=F" in hist_data:
+            try:
+                gdx = hist_data["GDX"]
+                gc = hist_data["GC=F"].reindex(gdx.index, method="ffill")
+                aisc_proxy = (gdx / gc * 1000).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(aisc_proxy) > 10:
+                    hist_data["AISC"] = aisc_proxy
+            except Exception as e:
+                fetch_errors.append(f"AISC proxy calc: {e}")
+
+        # ── AU_ALLOCATION already computed above from GC=F + M2SL ──
+        # (kept as-is; no change needed here)
+
     except Exception as e:
         fetch_errors.append(f"YF bulk download: {e}")
 
@@ -760,20 +781,120 @@ def fetch_historical_data():
     except Exception as e:
         fetch_errors.append(f"COMEX_INV: {e}")
 
-    # 3. Simulate remaining factors that have no free API source
-    # These use random walks as placeholders until real data sources are connected.
-    np.random.seed(int(end_date.strftime("%d")))
-    dates = pd.date_range(start=start_date, end=end_date, freq='B')
+    # 2C. CB_BUYING proxy: 12-month change in world gold holdings (WRMFSL via FRED)
+    # WRMFSL = world monetary gold holdings in millions of troy oz.
+    # Rising reserves → positive CB_BUYING signal.
+    try:
+        wrmf_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WRMFSL"
+        cb_resp = requests.get(wrmf_url, timeout=15)
+        if cb_resp.status_code == 200:
+            cb_df = pd.read_csv(io.StringIO(cb_resp.text))
+            # FRED CSV uses 'observation_date' as the column name
+            date_col = "observation_date" if "observation_date" in cb_df.columns else cb_df.columns[0]
+            cb_df[date_col] = pd.to_datetime(cb_df[date_col], errors="coerce")
+            cb_df = cb_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+            cb_series = pd.to_numeric(cb_df.iloc[:, 0], errors="coerce").dropna()
+            if len(cb_series) > 10:
+                # 12-month change in world gold holdings as CB demand signal (in Moz/yr)
+                cb_change = cb_series.diff(12).dropna()
+                cb_daily = cb_change.resample("D").last().ffill()
+                hist_data["CB_BUYING"] = cb_daily.dropna()
+        else:
+            fetch_errors.append(f"CB_BUYING proxy: WRMFSL HTTP {cb_resp.status_code}")
+    except Exception as e:
+        fetch_errors.append(f"CB_BUYING proxy: {e}")
 
+    # 2D. US_CDS proxy: 3M T-bill (DGS3MO) minus Fed Funds rate — sovereign stress signal
+    if "FEDFUNDS" in hist_data:
+        try:
+            dgs3m_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
+            dgs3m_resp = requests.get(dgs3m_url, timeout=15)
+            if dgs3m_resp.status_code == 200:
+                dgs3m_df = pd.read_csv(io.StringIO(dgs3m_resp.text))
+                date_col = "observation_date" if "observation_date" in dgs3m_df.columns else dgs3m_df.columns[0]
+                dgs3m_df[date_col] = pd.to_datetime(dgs3m_df[date_col], errors="coerce")
+                dgs3m_df = dgs3m_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+                dgs3m = pd.to_numeric(dgs3m_df.iloc[:, 0], errors="coerce").dropna()
+                if len(dgs3m) > 10:
+                    ff_aligned = hist_data["FEDFUNDS"].reindex(dgs3m.index, method="ffill")
+                    us_cds_proxy = (ff_aligned - dgs3m).dropna()
+                    if len(us_cds_proxy) > 10:
+                        hist_data["US_CDS"] = us_cds_proxy
+        except Exception as e:
+            fetch_errors.append(f"US_CDS proxy: {e}")
+
+    # 2E. IN_PREM proxy: gold price in INR — deviation from 20D trend
+    # Uses FRED DEXINUS (INR per USD) × GC=F to compute Indian gold price,
+    # then calculates 5D rolling average of 20D % change as the premium signal.
+    if "GC=F" in hist_data:
+        try:
+            inr_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXINUS"
+            inr_resp = requests.get(inr_url, timeout=15)
+            if inr_resp.status_code == 200:
+                inr_df = pd.read_csv(io.StringIO(inr_resp.text))
+                date_col = "observation_date" if "observation_date" in inr_df.columns else inr_df.columns[0]
+                inr_df[date_col] = pd.to_datetime(inr_df[date_col], errors="coerce")
+                inr_df = inr_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+                inr = pd.to_numeric(inr_df.iloc[:, 0], errors="coerce").dropna()
+                if len(inr) > 10:
+                    gc_aligned = hist_data["GC=F"].reindex(inr.index, method="ffill")
+                    gold_inr = (gc_aligned * inr).dropna()
+                    in_prem = gold_inr.pct_change(20).rolling(5).mean().dropna() * 100
+                    if len(in_prem) > 10:
+                        hist_data["IN_PREM"] = in_prem
+        except Exception as e:
+            fetch_errors.append(f"IN_PREM proxy: {e}")
+
+    # 2F. CFTC COT Data fallback — only if Socrata API didn't already fetch COT data
+    if "COT_MM" not in hist_data:
+        try:
+            import io as _cot_io, zipfile as _cot_zip
+            current_year = pd.Timestamp.now().year
+            cot_dfs = []
+            for yr in range(max(2019, current_year - 5), current_year + 1):
+                try:
+                    url = f"https://www.cftc.gov/files/dea/history/fut_disagg_txt_{yr}.zip"
+                    resp = requests.get(url, timeout=30)
+                    if resp.status_code == 200:
+                        zf = _cot_zip.ZipFile(_cot_io.BytesIO(resp.content))
+                        fname = [n for n in zf.namelist() if n.lower().endswith('.txt') or n.lower().endswith('.csv')][0]
+                        cot_df = pd.read_csv(zf.open(fname), low_memory=False)
+                        cot_dfs.append(cot_df)
+                except Exception:
+                    pass
+            if cot_dfs:
+                cot_all = pd.concat(cot_dfs, ignore_index=True)
+                gold_cot = cot_all[cot_all['CFTC_Contract_Market_Code'].astype(str).str.strip() == '088691']
+                if len(gold_cot) == 0:
+                    gold_cot = cot_all[cot_all['Market_and_Exchange_Names'].str.upper().str.contains('GOLD', na=False)]
+                if len(gold_cot) > 0:
+                    gold_cot = gold_cot.copy()
+                    date_col = None
+                    for _dc in ['Report_Date_as_YYYY-MM-DD', 'Report_Date_as_MM_DD_YYYY', 'As_of_Date_In_Form_YYMMDD']:
+                        if _dc in gold_cot.columns:
+                            date_col = _dc
+                            break
+                    if date_col is None:
+                        raise KeyError(f"No known date column in CFTC CSV. Columns: {list(gold_cot.columns[:10])}")
+                    gold_cot['_date'] = pd.to_datetime(gold_cot[date_col], errors='coerce')
+                    gold_cot = gold_cot.dropna(subset=['_date']).set_index('_date').sort_index()
+                    if 'M_Money_Positions_Long_All' in gold_cot.columns and 'M_Money_Positions_Short_All' in gold_cot.columns:
+                        mm_net = gold_cot['M_Money_Positions_Long_All'].astype(float) - gold_cot['M_Money_Positions_Short_All'].astype(float)
+                        hist_data["COT_MM"] = mm_net.resample('D').last().ffill().dropna()
+                    sd_short_col = 'Swap__Positions_Short_All' if 'Swap__Positions_Short_All' in gold_cot.columns else 'Swap_Positions_Short_All'
+                    if 'Swap_Positions_Long_All' in gold_cot.columns and sd_short_col in gold_cot.columns:
+                        sd_net = gold_cot['Swap_Positions_Long_All'].astype(float) - gold_cot[sd_short_col].astype(float)
+                        hist_data["COT_SD"] = sd_net.resample('D').last().ffill().dropna()
+                    if 'Open_Interest_All' in gold_cot.columns:
+                        hist_data["COMEX_OI"] = gold_cot['Open_Interest_All'].astype(float).resample('D').last().ffill().dropna()
+        except Exception as e:
+            fetch_errors.append(f"CFTC COT: {e}")
+
+    # Count factors with no real data (excluded from scoring)
     simulated_count = 0
     for category in FACTOR_CONFIG.values():
         for item in category:
-            ticker = item['ticker']
-            if item['source'] == 'SIMULATED' and ticker not in hist_data:
-                steps = np.random.normal(loc=0.01, scale=1.5, size=len(dates))
-                walk = np.cumsum(steps)
-                walk = (walk - walk.min()) + 5.0
-                hist_data[ticker] = pd.Series(walk, index=dates)
+            if item['ticker'] not in hist_data:
                 simulated_count += 1
 
     # Store metadata for display
@@ -922,6 +1043,18 @@ def calculate_statistics(series, config):
     # Mathematical Z-Score Formula: (Current - Mean) / Std
     z_score = (current_val - mean_5y) / std_5y if std_5y != 0 else 0.0
 
+    # 52-week (252 trading days) momentum z-score
+    series_52w = series.iloc[-252:] if len(series) > 252 else series
+    mean_52w = float(series_52w.mean())
+    std_52w = float(series_52w.std())
+    z_score_52w = (current_val - mean_52w) / std_52w if std_52w != 0 else 0.0
+
+    # 13-week (65 trading days) tactical z-score
+    series_13w = series.iloc[-65:] if len(series) > 65 else series
+    mean_13w = float(series_13w.mean())
+    std_13w = float(series_13w.std())
+    z_score_13w = (current_val - mean_13w) / std_13w if std_13w != 0 else 0.0
+
     # Percentile
     percentile = float((series < current_val).mean() * 100)
 
@@ -931,11 +1064,17 @@ def calculate_statistics(series, config):
 
     if is_bullish:
         raw_score = z_score * weight
+        raw_score_52w = z_score_52w * weight
+        raw_score_13w = z_score_13w * weight
     else:
         raw_score = -z_score * weight
+        raw_score_52w = -z_score_52w * weight
+        raw_score_13w = -z_score_13w * weight
 
     # Cap maximum scores structurally
     factor_score = max(min(raw_score, weight * 3), -weight * 3)
+    factor_score_52w = max(min(raw_score_52w, weight * 3), -weight * 3)
+    factor_score_13w = max(min(raw_score_13w, weight * 3), -weight * 3)
 
     if factor_score > (weight * 0.5):
         color = "Green"
@@ -952,17 +1091,23 @@ def calculate_statistics(series, config):
         "5Y Mean": format_value_with_unit(mean_5y, unit),
         "5Y Std": f"{std_5y:.2f}",
         "Z-Score": f"{z_score:.2f}",
+        "Z-52w": f"{z_score_52w:.2f}",
+        "Z-13w": f"{z_score_13w:.2f}",
         "Percentile": f"{percentile:.0f}%",
         "Total Factor Score": round(factor_score, 1),
+        "Factor Score 52w": round(factor_score_52w, 1),
+        "Factor Score 13w": round(factor_score_13w, 1),
         "Colour Indicator": color
     }
 
-def compute_rolling_scores(historical_data, n_days=50):
+def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
     """
     Compute a daily Gold Score time series over the last n_days using cluster-aware scoring.
     For each day t in the window, we treat each factor's value at day t as
-    'current' and compute its z-score against the full 5Y history up to day t.
-    Factors are averaged within clusters before summing to prevent redundancy.
+    'current' and compute its z-score against the history up to day t.
+
+    z_lookback: number of trading days to use for z-score mean/std calculation.
+        None = full history (structural), 252 = 52-week, 65 = 13-week.
     Returns a pd.Series of normalized gold scores indexed by date.
     """
     end_date = datetime.now()
@@ -997,6 +1142,9 @@ def compute_rolling_scores(historical_data, n_days=50):
     # max contribution per cluster = max_w * max_w * 3 (matching main scoring)
     max_possible_score = sum(mw * mw * 3 for mw in cluster_max_weight.values()) if cluster_max_weight else 1.0
 
+    # Minimum observations needed for a valid z-score
+    min_obs = max(10, (z_lookback // 4) if z_lookback else 10)
+
     daily_scores = {}
     for d in sampled_dates:
         # Collect factor scores grouped by cluster with weights
@@ -1008,11 +1156,16 @@ def compute_rolling_scores(historical_data, n_days=50):
                 if series is None or len(series) < 10:
                     continue
                 s_up_to = series[series.index <= d]
-                if len(s_up_to) < 10:
+                if len(s_up_to) < min_obs:
                     continue
+                # Apply lookback window for z-score if specified
+                if z_lookback and len(s_up_to) > z_lookback:
+                    s_window = s_up_to.iloc[-z_lookback:]
+                else:
+                    s_window = s_up_to
                 current_val = float(s_up_to.iloc[-1])
-                mean_val = float(s_up_to.mean())
-                std_val = float(s_up_to.std())
+                mean_val = float(s_window.mean())
+                std_val = float(s_window.std())
                 if std_val == 0:
                     continue
                 z = (current_val - mean_val) / std_val
@@ -1182,11 +1335,7 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
             stats = calculate_statistics(series, item)
 
             # Determine actual data source status
-            if item['source'] == 'SIMULATED' and (series is None or ticker not in historical_data):
-                source_label = f"{ticker} (Simulated)"
-            elif item['source'] == 'SIMULATED' and ticker in historical_data:
-                source_label = f"{ticker} (Simulated)"
-            elif series is not None and len(series) >= 10:
+            if series is not None and len(series) >= 10:
                 source_label = f"{ticker} ({item['source']})"
             else:
                 source_label = f"{ticker} (No Data)"
@@ -1208,7 +1357,11 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
                 "Sparkline": sparkline_svg,
                 "Colour Indicator": stats["Colour Indicator"],
                 "Total Factor Score": stats["Total Factor Score"],
+                "Factor Score 52w": stats.get("Factor Score 52w", 0),
+                "Factor Score 13w": stats.get("Factor Score 13w", 0),
                 "Z-Score": stats.get("Z-Score", "N/A"),
+                "Z-52w": stats.get("Z-52w", "N/A"),
+                "Z-13w": stats.get("Z-13w", "N/A"),
                 "5Y Mean": stats.get("5Y Mean", "N/A"),
                 "Percentile": stats.get("Percentile", "N/A"),
                 "Why It Matters": item['why'],
@@ -1219,7 +1372,9 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
     final_df = pd.DataFrame(report_data)
 
     # Compute rolling Gold Scores for sparkline and chart
-    rolling_scores = compute_rolling_scores(historical_data, n_days=90)
+    rolling_scores = compute_rolling_scores(historical_data, n_days=90)  # structural (full history z)
+    rolling_scores_52w = compute_rolling_scores(historical_data, n_days=90, z_lookback=252)  # 52w momentum
+    rolling_scores_13w = compute_rolling_scores(historical_data, n_days=90, z_lookback=65)   # 13w tactical
 
     # Fetch market headlines
     headlines = fetch_market_headlines()
@@ -1240,56 +1395,87 @@ for indicators in FACTOR_CONFIG.values():
 
 if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any():
     # For each cluster: compute weighted average of factor scores, and track max weight
-    cluster_data = {}  # {cluster: {'weighted_sum': float, 'weight_sum': float, 'max_weight': float}}
+    # We compute structural (full history), momentum (52-week), and tactical (13-week) scores
+    cluster_data = {}       # structural
+    cluster_data_52w = {}   # 52-week momentum
+    cluster_data_13w = {}   # 13-week tactical
     for _, row in final_df.iterrows():
         cg = row.get('Cluster Group', row['Indicator'])
         w = _weight_lookup.get(row['Indicator'], 1)
-        fs = row['Total Factor Score']
-        if cg not in cluster_data:
-            cluster_data[cg] = {'weighted_sum': 0.0, 'weight_sum': 0.0, 'max_weight': 0}
-        cluster_data[cg]['weighted_sum'] += fs * w  # weight the score by its own weight
-        cluster_data[cg]['weight_sum'] += w
-        cluster_data[cg]['max_weight'] = max(cluster_data[cg]['max_weight'], w)
+        # Skip factors with no real data — they have Value "N/A"
+        has_data = row.get('Value') != "N/A"
+        fs = row['Total Factor Score'] if has_data else 0.0
+        fs_52w = row.get('Factor Score 52w', fs) if has_data else 0.0
+        fs_13w = row.get('Factor Score 13w', fs) if has_data else 0.0
+        for cd_dict, fs_val in [(cluster_data, fs), (cluster_data_52w, fs_52w), (cluster_data_13w, fs_13w)]:
+            if cg not in cd_dict:
+                cd_dict[cg] = {'weighted_sum': 0.0, 'weight_sum': 0.0, 'max_weight': 0, 'has_any_data': False}
+            if has_data:
+                cd_dict[cg]['weighted_sum'] += fs_val * w
+                cd_dict[cg]['weight_sum'] += w
+                cd_dict[cg]['max_weight'] = max(cd_dict[cg]['max_weight'], w)
+                cd_dict[cg]['has_any_data'] = True
 
-    # Each cluster gets a normalized score in [-3, +3] (since factor_score is capped at w*3)
-    # Then we weight each cluster by its max_weight for the final sum
+    # Each cluster gets a normalized score, weighted by max_weight
     cluster_weighted_scores = {}
+    cluster_weighted_scores_52w = {}
+    cluster_weighted_scores_13w = {}
     cluster_max_contributions = {}
     for cg, cd in cluster_data.items():
-        # Weighted average score for cluster (if all factors maxed at +3*w, this = 3*w)
-        if cd['weight_sum'] > 0:
-            cluster_avg = cd['weighted_sum'] / cd['weight_sum']
+        # Skip clusters with zero real data — they don't contribute to score or max
+        if not cd.get('has_any_data', False):
+            continue
+        cd_52w = cluster_data_52w[cg]
+        cd_13w = cluster_data_13w[cg]
+        ws = cd['weight_sum']
+        if ws > 0:
+            cluster_avg = cd['weighted_sum'] / ws
+            cluster_avg_52w = cd_52w['weighted_sum'] / cd_52w['weight_sum'] if cd_52w['weight_sum'] > 0 else 0.0
+            cluster_avg_13w = cd_13w['weighted_sum'] / cd_13w['weight_sum'] if cd_13w['weight_sum'] > 0 else 0.0
         else:
-            cluster_avg = 0.0
-        # Scale by max weight: high-weight clusters pull the total more
+            cluster_avg = cluster_avg_52w = cluster_avg_13w = 0.0
         mw = cd['max_weight']
         cluster_weighted_scores[cg] = cluster_avg * mw
-        cluster_max_contributions[cg] = mw * mw * 3  # max contribution = max_w * (max_w * 3)
+        cluster_weighted_scores_52w[cg] = cluster_avg_52w * mw
+        cluster_weighted_scores_13w[cg] = cluster_avg_13w * mw
+        cluster_max_contributions[cg] = mw * mw * 3
 
     overall_score = sum(cluster_weighted_scores.values())
+    overall_score_52w = sum(cluster_weighted_scores_52w.values())
+    overall_score_13w = sum(cluster_weighted_scores_13w.values())
     max_possible_score = sum(cluster_max_contributions.values()) if cluster_max_contributions else 1.0
     num_clusters = len(cluster_data)
 
-    # Compute each factor's contribution to the overall score
-    # contribution = (fs × w / cluster_weight_sum) × cluster_max_weight
+    # Compute each factor's contribution to the overall score (all three timeframes)
     _factor_overall_contrib = {}
+    _factor_overall_contrib_52w = {}
+    _factor_overall_contrib_13w = {}
     for _, row in final_df.iterrows():
         cg = row.get('Cluster Group', row['Indicator'])
         w = _weight_lookup.get(row['Indicator'], 1)
         fs = row['Total Factor Score']
+        fs_52w = row.get('Factor Score 52w', fs)
+        fs_13w = row.get('Factor Score 13w', fs)
         cd = cluster_data.get(cg, {})
         ws = cd.get('weight_sum', 1)
         mw = cd.get('max_weight', w)
-        contrib = (fs * w / ws) * mw if ws > 0 else 0.0
-        _factor_overall_contrib[row['Indicator']] = contrib
+        _factor_overall_contrib[row['Indicator']] = (fs * w / ws) * mw if ws > 0 else 0.0
+        _factor_overall_contrib_52w[row['Indicator']] = (fs_52w * w / ws) * mw if ws > 0 else 0.0
+        _factor_overall_contrib_13w[row['Indicator']] = (fs_13w * w / ws) * mw if ws > 0 else 0.0
     final_df['Overall Contribution'] = final_df['Indicator'].map(_factor_overall_contrib).fillna(0.0)
+    final_df['Overall Contribution 52w'] = final_df['Indicator'].map(_factor_overall_contrib_52w).fillna(0.0)
+    final_df['Overall Contribution 13w'] = final_df['Indicator'].map(_factor_overall_contrib_13w).fillna(0.0)
 
-    # Store breakdown for display
+    # Store breakdown for display (only clusters with real data)
     cluster_breakdown = {}
     for cg, cd in cluster_data.items():
+        if not cd.get('has_any_data', False):
+            continue
         mw = cd['max_weight']
         cluster_breakdown[cg] = {
             'score': cluster_weighted_scores[cg],
+            'score_52w': cluster_weighted_scores_52w[cg],
+            'score_13w': cluster_weighted_scores_13w[cg],
             'max': cluster_max_contributions[cg],
             'pct': cluster_weighted_scores[cg] / max_possible_score * 100 if max_possible_score > 0 else 0,
             'max_weight': mw,
@@ -1297,6 +1483,8 @@ if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any
 else:
     # Fallback: simple weighted sum
     overall_score = final_df['Total Factor Score'].sum()
+    overall_score_52w = final_df.get('Factor Score 52w', final_df['Total Factor Score']).sum()
+    overall_score_13w = final_df.get('Factor Score 13w', final_df['Total Factor Score']).sum()
     max_possible_score = sum(
         item['weight'] * 3
         for indicators in FACTOR_CONFIG.values()
@@ -1347,27 +1535,30 @@ if cluster_breakdown:
 gold_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
 gold_score = max(min(gold_score, 1.0), -1.0)
 
-# Interpretation scale
-if gold_score >= 0.5:
-    interpretation = "Strong Bullish"
-    interp_color = "#22c55e"
-    interp_emoji = "🟢🟢"
-elif gold_score >= 0.1:
-    interpretation = "Moderately Bullish"
-    interp_color = "#86efac"
-    interp_emoji = "🟢"
-elif gold_score > -0.1:
-    interpretation = "Neutral"
-    interp_color = "#facc15"
-    interp_emoji = "🟡"
-elif gold_score > -0.5:
-    interpretation = "Moderately Bearish"
-    interp_color = "#fca5a5"
-    interp_emoji = "🔴"
-else:
-    interpretation = "Strong Bearish"
-    interp_color = "#ef4444"
-    interp_emoji = "🔴🔴"
+# 52-week Momentum Score
+momentum_score = overall_score_52w / max_possible_score if max_possible_score > 0 else 0.0
+momentum_score = max(min(momentum_score, 1.0), -1.0)
+
+# 13-week Tactical Score
+tactical_score = overall_score_13w / max_possible_score if max_possible_score > 0 else 0.0
+tactical_score = max(min(tactical_score, 1.0), -1.0)
+
+def _interpret_score(sc):
+    """Return (label, color, emoji) for a normalized score."""
+    if sc >= 0.5:
+        return "Strong Bullish", "#22c55e", "🟢🟢"
+    elif sc >= 0.1:
+        return "Moderately Bullish", "#86efac", "🟢"
+    elif sc > -0.1:
+        return "Neutral", "#facc15", "🟡"
+    elif sc > -0.5:
+        return "Moderately Bearish", "#fca5a5", "🔴"
+    else:
+        return "Strong Bearish", "#ef4444", "🔴🔴"
+
+interpretation, interp_color, interp_emoji = _interpret_score(gold_score)
+mom_interpretation, mom_interp_color, mom_interp_emoji = _interpret_score(momentum_score)
+tac_interpretation, tac_interp_color, tac_interp_emoji = _interpret_score(tactical_score)
 
 # ─── Summary Score Panel ─────────────────────────────────────────────────────
 
@@ -1397,9 +1588,9 @@ score_sparkline_svg = make_sparkline_svg(rolling_scores, n_days=90, width=180, h
 _summary_html = (
     '<div class="summary-panel">'
     '<div class="summary-flex">'
-    # Big score + sparkline
+    # Big structural score + sparkline
     '<div class="summary-score-block">'
-    '<div class="summary-label">Gold Score</div>'
+    '<div class="summary-label">Structural Score</div>'
     f'<div class="summary-score-value" style="color:{interp_color};">{gold_score:+.2f}</div>'
     f'<div class="summary-interp" style="color:{interp_color};">'
     f'{interp_emoji} {interpretation}</div>'
@@ -1409,19 +1600,39 @@ _summary_html = (
     f'{score_sparkline_svg}'
     '</div>'
     '</div>'
-    # Score breakdown — show top cluster contributions
+    # 52-week momentum score
+    '<div class="summary-score-block">'
+    '<div class="summary-label">52w Momentum</div>'
+    f'<div class="summary-score-value" style="color:{mom_interp_color};font-size:1.6rem;">{momentum_score:+.2f}</div>'
+    f'<div class="summary-interp" style="color:{mom_interp_color};font-size:0.72rem;">'
+    f'{mom_interp_emoji} {mom_interpretation}</div>'
+    '</div>'
+    '<div class="summary-score-block">'
+    '<div class="summary-label">13w Tactical</div>'
+    f'<div class="summary-score-value" style="color:{tac_interp_color};font-size:1.6rem;">{tactical_score:+.2f}</div>'
+    f'<div class="summary-interp" style="color:{tac_interp_color};font-size:0.72rem;">'
+    f'{tac_interp_emoji} {tac_interpretation}</div>'
+    '</div>'
+    # Score breakdown
     '<div class="summary-breakdown">'
     '<div class="summary-label" style="margin-bottom:10px;">Score Breakdown</div>'
     '<table class="summary-table">'
-    f'<tr><td>Weighted Score</td>'
-    f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td></tr>'
-    f'<tr><td>Max Possible</td>'
+    f'<tr><td></td><td class="summary-td-right" style="font-size:0.6rem;color:#666;">Struct.</td>'
+    f'<td class="summary-td-right" style="font-size:0.6rem;color:#666;">52w</td>'
+    f'<td class="summary-td-right" style="font-size:0.6rem;color:#666;">13w</td></tr>'
+    f'<tr><td>Weighted</td>'
+    f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td>'
+    f'<td class="summary-td-right" style="font-weight:600;">{overall_score_52w:+.1f}</td>'
+    f'<td class="summary-td-right" style="font-weight:600;">{overall_score_13w:+.1f}</td></tr>'
+    f'<tr><td>Max</td>'
+    f'<td class="summary-td-right">±{max_possible_score:.0f}</td>'
+    f'<td class="summary-td-right">±{max_possible_score:.0f}</td>'
     f'<td class="summary-td-right">±{max_possible_score:.0f}</td></tr>'
     f'<tr style="border-top:1px solid #333;">'
-    f'<td style="padding-top:6px;">Normalized</td>'
-    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{interp_color};">{gold_score:+.2f}</td></tr>'
-    f'<tr><td>Last Period Δ</td>'
-    f'<td class="summary-td-right" style="font-weight:600;color:{score_chg_color};">{score_chg_str}</td></tr>'
+    f'<td style="padding-top:6px;">Norm.</td>'
+    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{interp_color};">{gold_score:+.2f}</td>'
+    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{mom_interp_color};">{momentum_score:+.2f}</td>'
+    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{tac_interp_color};">{tactical_score:+.2f}</td></tr>'
     '</table>'
     '</div>'
     '</div>'
@@ -1572,7 +1783,7 @@ if _gc is not None and len(_gc) > 200:
 _summary_html += _targets_html + (
     f'<div class="summary-footer">'
     f'{total_factors} factors &middot; {num_clusters} clusters &middot; '
-    f'{total_factors - simulated_count} live &middot; {simulated_count} simulated</div>'
+    f'{total_factors - simulated_count} live &middot; {simulated_count} no data (excluded)</div>'
 ) + (
     # Gauge bar
     '<div class="gauge-wrap">'
@@ -1649,6 +1860,7 @@ if cluster_breakdown:
     _cb_rows = ""
     for _cg_name, _cb in _sorted_clusters:
         _cb_score = _cb['score']
+        _cb_score_52w = _cb.get('score_52w', _cb_score)
         _cb_max = _cb['max']
         _cb_mw = _cb['max_weight']
         _norm = _cb_score / _cb_max if _cb_max > 0 else 0
@@ -1661,6 +1873,21 @@ if cluster_breakdown:
         else:
             _cb_color = "#facc15"
             _cb_dir = "Neutral"
+        _cb_score_13w = _cb.get('score_13w', _cb_score)
+        # 52w signal color
+        if _cb_score_52w > 0.5:
+            _cb_52w_color = "#22c55e"
+        elif _cb_score_52w < -0.5:
+            _cb_52w_color = "#ef4444"
+        else:
+            _cb_52w_color = "#facc15"
+        # 13w signal color
+        if _cb_score_13w > 0.5:
+            _cb_13w_color = "#22c55e"
+        elif _cb_score_13w < -0.5:
+            _cb_13w_color = "#ef4444"
+        else:
+            _cb_13w_color = "#facc15"
         # Bar: proportional to score relative to largest cluster
         _bar_pct = (abs(_cb_score) / _max_abs_score * 100) if _max_abs_score > 0 else 0
         _bar_pct = max(min(_bar_pct, 100), 1)
@@ -1685,8 +1912,10 @@ if cluster_breakdown:
             f'</span></td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:center;">{_cb_mw:.0f}</td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_color};font-weight:600;">{_cb_score:+.1f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_52w_color};font-weight:600;">{_cb_score_52w:+.1f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_13w_color};font-weight:600;">{_cb_score_13w:+.1f}</td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;">{_cb_max:.0f}</td>'
-            f'<td style="padding:4px 6px;width:25%;">{_bar_html}</td>'
+            f'<td style="padding:4px 6px;width:22%;">{_bar_html}</td>'
             f'<td style="padding:4px 6px;font-size:0.75rem;text-align:center;font-weight:600;">{_chg_str}</td>'
             f'<td style="padding:4px 6px;font-size:0.75rem;text-align:center;color:{_cb_color};">{_cb_dir}</td>'
             f'</tr>'
@@ -1717,13 +1946,17 @@ if cluster_breakdown:
         '(flipped for bearish-when-high). Capped at <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">±weight×3</code>. '
         'Within each cluster, scores are <b>weight-averaged</b>. Then each cluster contributes '
         '<code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">cluster_avg × max_weight</code> to the total. '
-        f'Final: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{overall_score:+.1f} / {max_possible_score:.0f} = {gold_score:+.3f}</code>'
+        f'Structural: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{gold_score:+.3f}</code> · '
+        f'52w: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{momentum_score:+.3f}</code> · '
+        f'13w: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{tactical_score:+.3f}</code>'
         '</div>'
         '<table class="factor-table" style="table-layout:auto;">'
         '<tr>'
         '<th style="padding:5px 6px;text-align:left;">Cluster</th>'
         '<th style="padding:5px 6px;text-align:center;">Wt</th>'
-        '<th style="padding:5px 6px;text-align:right;">Score</th>'
+        '<th style="padding:5px 6px;text-align:right;">Struct.</th>'
+        '<th style="padding:5px 6px;text-align:right;">52w</th>'
+        '<th style="padding:5px 6px;text-align:right;">13w</th>'
         '<th style="padding:5px 6px;text-align:right;">Max</th>'
         '<th style="padding:5px 6px;text-align:left;">Contribution</th>'
         '<th style="padding:5px 6px;text-align:center;">Δ Day</th>'
@@ -1734,6 +1967,8 @@ if cluster_breakdown:
         f'<td style="padding:6px;font-weight:700;">TOTAL</td>'
         f'<td></td>'
         f'<td style="padding:6px;text-align:right;font-weight:700;color:{interp_color};">{overall_score:+.1f}</td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;color:{mom_interp_color};">{overall_score_52w:+.1f}</td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;color:{tac_interp_color};">{overall_score_13w:+.1f}</td>'
         f'<td style="padding:6px;text-align:right;font-weight:700;">{max_possible_score:.0f}</td>'
         f'<td style="padding:6px;font-weight:700;color:{interp_color};">= {gold_score:+.3f}</td>'
         f'<td style="padding:6px;text-align:center;font-weight:600;">{_total_chg_str}</td>'
@@ -1741,7 +1976,7 @@ if cluster_breakdown:
         '</tr>'
         '</table></div>'
     )
-    with st.expander(f"📊 Score Calculation — {num_clusters} clusters, {total_factors} factors → {gold_score:+.3f}", expanded=False):
+    with st.expander(f"📊 Score Calculation — {num_clusters} clusters, {total_factors} factors → Struct. {gold_score:+.3f} · 52w {momentum_score:+.3f} · 13w {tactical_score:+.3f}", expanded=False):
         st.markdown(_calc_html, unsafe_allow_html=True)
 
 # ─── Analyst Forecasts Detail Expander ─────────────────────────────────────
@@ -1885,9 +2120,27 @@ if gc_series is not None and len(rolling_scores) > 3:
     fig.add_trace(
         go.Scatter(
             x=rolling_scores.index, y=rolling_scores.values,
-            name="Gold Score", mode="lines",
-            line=dict(color="#60a5fa", width=2, dash="dot"),
-            hovertemplate="<b>Gold Score</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+            name="Structural", mode="lines",
+            line=dict(color="#60a5fa", width=2),
+            hovertemplate="<b>Structural</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=rolling_scores_52w.index, y=rolling_scores_52w.values,
+            name="52w Momentum", mode="lines",
+            line=dict(color="#a78bfa", width=1.5, dash="dash"),
+            hovertemplate="<b>52w Momentum</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=rolling_scores_13w.index, y=rolling_scores_13w.values,
+            name="13w Tactical", mode="lines",
+            line=dict(color="#34d399", width=1.5, dash="dot"),
+            hovertemplate="<b>13w Tactical</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
         ),
         secondary_y=True,
     )
@@ -1899,11 +2152,11 @@ if gc_series is not None and len(rolling_scores) > 3:
         paper_bgcolor="#0f0f23",
         plot_bgcolor="#0e0e1a",
         font=dict(color="#d0d0d0"),
-        height=420,
+        height=450,
         autosize=True,
-        margin=dict(l=45, r=45, t=25, b=35),
+        margin=dict(l=45, r=45, t=30, b=35),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="center", x=0.5, font=dict(size=11)),
+                    xanchor="center", x=0.5, font=dict(size=10)),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="rgba(15,15,35,0.9)", font_size=12, font_color="#d0d0d0"),
     )
@@ -1916,7 +2169,7 @@ if gc_series is not None and len(rolling_scores) > 3:
                      showgrid=True, secondary_y=False, tickformat="$,.0f",
                      title_font=dict(color="#FFD700", size=11),
                      tickfont=dict(color="#ccc"))
-    fig.update_yaxes(title_text="Score", secondary_y=True, range=[-1.05, 1.05],
+    fig.update_yaxes(title_text="Scores", secondary_y=True, range=[-1.05, 1.05],
                      tickformat="+.2f", title_font=dict(color="#60a5fa", size=11),
                      gridcolor="rgba(255,255,255,0.03)",
                      tickfont=dict(color="#ccc"))
@@ -2220,7 +2473,7 @@ renderHeadlines(null);
         });
 
         // Hover dots — draw SVG circles on each trace at the hovered x position
-        var dotColors = ["#FFD700", "#60a5fa"];
+        var dotColors = ["#FFD700", "#60a5fa", "#a78bfa", "#34d399"];
 
         gd.on("plotly_hover", function(evtData) {
             // Remove previous dots
