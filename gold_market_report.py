@@ -9,6 +9,7 @@ import io
 import ssl
 import re
 import json
+import math
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -1040,45 +1041,64 @@ def calculate_statistics(series, config):
         change_str = "N/A"
         change_color = "gray"
 
-    # Mathematical Z-Score Formula: (Current - Mean) / Std
+    # Z-Score (kept for display, not used for scoring)
     z_score = (current_val - mean_5y) / std_5y if std_5y != 0 else 0.0
 
-    # 52-week (252 trading days) momentum z-score
+    # Percentile rank scoring: where does current value sit in the distribution?
+    # Returns value in [0, 1] — 0.5 = median, 1.0 = highest ever, 0.0 = lowest ever
+    pctile_full = float((series < current_val).mean())
+
+    # 52-week percentile (trailing 252 trading days)
     series_52w = series.iloc[-252:] if len(series) > 252 else series
-    mean_52w = float(series_52w.mean())
-    std_52w = float(series_52w.std())
-    z_score_52w = (current_val - mean_52w) / std_52w if std_52w != 0 else 0.0
+    pctile_52w = float((series_52w < current_val).mean())
 
-    # 13-week (65 trading days) tactical z-score
+    # 13-week percentile (trailing 65 trading days)
     series_13w = series.iloc[-65:] if len(series) > 65 else series
-    mean_13w = float(series_13w.mean())
-    std_13w = float(series_13w.std())
-    z_score_13w = (current_val - mean_13w) / std_13w if std_13w != 0 else 0.0
+    pctile_13w = float((series_13w < current_val).mean())
 
-    # Percentile
-    percentile = float((series < current_val).mean() * 100)
+    # Asymmetric signal: tanh compresses extremes, amplifies changes near the median
+    # tanh(x*4) maps: 0→-1, 0.25→-0.76, 0.5→0, 0.75→+0.76, 1→+1
+    # vs linear: 0→-1, 0.25→-0.5, 0.5→0, 0.75→+0.5, 1→+1
+    # The difference: stronger signal in the 30-70th percentile range where actionable moves happen
+    signal_full = math.tanh((pctile_full - 0.5) * 4)
+    signal_52w = math.tanh((pctile_52w - 0.5) * 4)
+    signal_13w = (pctile_13w - 0.5) * 2  # linear for short-term — better 20d DA per backtest
 
-    # Directional Scoring
+    # Momentum feature: rate-of-change of the 52w percentile over the last 20 trading days
+    # If the percentile is RISING, the factor is strengthening → momentum bonus
+    # Momentum contributes up to ±25% of the base signal
+    momentum_bonus_52w = 0.0
+    if len(series) > 272:  # need 252 + 20 days for lookback
+        val_20d_ago_idx = max(0, len(series) - 21)
+        val_20d_ago = float(series.iloc[val_20d_ago_idx])
+        series_52w_20d_ago = series.iloc[max(0, val_20d_ago_idx - 252):val_20d_ago_idx]
+        if len(series_52w_20d_ago) > 20:
+            pctile_52w_20d_ago = float((series_52w_20d_ago < val_20d_ago).mean())
+            pctile_delta = pctile_52w - pctile_52w_20d_ago  # positive = rising percentile
+            momentum_bonus_52w = math.tanh(pctile_delta * 6) * 0.25  # ±0.25 max bonus
+    # No momentum bonus for 13w — linear percentile performs better at short horizons
+
+    # Percentile for display
+    percentile = pctile_full * 100
+
+    # Directional Scoring: signal × weight, flipped if higher is bearish
+    # Momentum bonus added to 52w and 13w signals (not structural — structural is level-only)
     weight = config['weight']
     is_bullish = config['higher_is_bullish']
 
-    if is_bullish:
-        raw_score = z_score * weight
-        raw_score_52w = z_score_52w * weight
-        raw_score_13w = z_score_13w * weight
-    else:
-        raw_score = -z_score * weight
-        raw_score_52w = -z_score_52w * weight
-        raw_score_13w = -z_score_13w * weight
+    direction = 1 if is_bullish else -1
+    factor_score = signal_full * weight * direction
+    # 52w: tanh + momentum (best at 60d horizon)
+    signal_52w_with_mom = max(min(signal_52w + momentum_bonus_52w * direction, 1.0), -1.0)
+    factor_score_52w = signal_52w_with_mom * weight * direction
+    # 13w: plain linear percentile (best at 20d horizon per backtest)
+    factor_score_13w = signal_13w * weight * direction
 
-    # Cap maximum scores structurally
-    factor_score = max(min(raw_score, weight * 3), -weight * 3)
-    factor_score_52w = max(min(raw_score_52w, weight * 3), -weight * 3)
-    factor_score_13w = max(min(raw_score_13w, weight * 3), -weight * 3)
+    # Factor scores bounded at ±weight (signals clamped to [-1, +1])
 
-    if factor_score > (weight * 0.5):
+    if factor_score > (weight * 0.15):
         color = "Green"
-    elif factor_score < -(weight * 0.5):
+    elif factor_score < -(weight * 0.15):
         color = "Red"
     else:
         color = "Yellow"
@@ -1091,22 +1111,23 @@ def calculate_statistics(series, config):
         "5Y Mean": format_value_with_unit(mean_5y, unit),
         "5Y Std": f"{std_5y:.2f}",
         "Z-Score": f"{z_score:.2f}",
-        "Z-52w": f"{z_score_52w:.2f}",
-        "Z-13w": f"{z_score_13w:.2f}",
+        "Pctile": f"{pctile_full:.0%}",
+        "Pctile-52w": f"{pctile_52w:.0%}",
+        "Pctile-13w": f"{pctile_13w:.0%}",
         "Percentile": f"{percentile:.0f}%",
-        "Total Factor Score": round(factor_score, 1),
-        "Factor Score 52w": round(factor_score_52w, 1),
-        "Factor Score 13w": round(factor_score_13w, 1),
+        "Total Factor Score": round(factor_score, 2),
+        "Factor Score 52w": round(factor_score_52w, 2),
+        "Factor Score 13w": round(factor_score_13w, 2),
         "Colour Indicator": color
     }
 
-def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
+def compute_rolling_scores(historical_data, n_days=50, z_lookback=None, sample_step=2):
     """
     Compute a daily Gold Score time series over the last n_days using cluster-aware scoring.
     For each day t in the window, we treat each factor's value at day t as
     'current' and compute its z-score against the history up to day t.
 
-    z_lookback: number of trading days to use for z-score mean/std calculation.
+    z_lookback: number of trading days to use for percentile rank calculation.
         None = full history (structural), 252 = 52-week, 65 = 13-week.
     Returns a pd.Series of normalized gold scores indexed by date.
     """
@@ -1122,8 +1143,8 @@ def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
     if len(date_range) < 5:
         return pd.Series(dtype=float)
 
-    # Sample every 2nd trading day to keep compute time reasonable (~45 points for 90 days)
-    sampled_dates = date_range[::2]
+    # Sample every Nth trading day to keep compute time reasonable
+    sampled_dates = date_range[::sample_step]
     if len(sampled_dates) < 3:
         sampled_dates = date_range
 
@@ -1139,11 +1160,11 @@ def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
             if cg not in cluster_factor_weights:
                 cluster_factor_weights[cg] = {}
             cluster_factor_weights[cg][item['ticker']] = w
-    # max contribution per cluster = max_w * max_w * 3 (matching main scoring)
-    max_possible_score = sum(mw * mw * 3 for mw in cluster_max_weight.values()) if cluster_max_weight else 1.0
+    # max contribution per cluster = max_w * max_w (percentile signal bounded at ±1, factor_score at ±weight)
+    max_possible_score = sum(mw * mw for mw in cluster_max_weight.values()) if cluster_max_weight else 1.0
 
-    # Minimum observations needed for a valid z-score
-    min_obs = max(10, (z_lookback // 4) if z_lookback else 10)
+    # Minimum observations needed for a valid percentile rank
+    min_obs = max(20, (z_lookback // 4) if z_lookback else 20)
 
     daily_scores = {}
     for d in sampled_dates:
@@ -1158,20 +1179,37 @@ def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
                 s_up_to = series[series.index <= d]
                 if len(s_up_to) < min_obs:
                     continue
-                # Apply lookback window for z-score if specified
+                # Apply lookback window for percentile if specified
                 if z_lookback and len(s_up_to) > z_lookback:
                     s_window = s_up_to.iloc[-z_lookback:]
                 else:
                     s_window = s_up_to
                 current_val = float(s_up_to.iloc[-1])
-                mean_val = float(s_window.mean())
-                std_val = float(s_window.std())
-                if std_val == 0:
-                    continue
-                z = (current_val - mean_val) / std_val
+                pctile = float((s_window < current_val).mean())
+
+                # 13w (z_lookback=65): linear percentile, no momentum (best at 20d)
+                # 52w/structural: tanh + momentum (best at 60d)
+                if z_lookback and z_lookback <= 65:
+                    signal = (pctile - 0.5) * 2  # linear
+                    momentum_bonus = 0.0
+                else:
+                    signal = math.tanh((pctile - 0.5) * 4)  # asymmetric
+                    # Momentum bonus: rate-of-change of percentile over last 20 days
+                    momentum_bonus = 0.0
+                    if len(s_up_to) > 20:
+                        val_20d_ago_idx = max(0, len(s_up_to) - 21)
+                        val_20d_ago = float(s_up_to.iloc[val_20d_ago_idx])
+                        lookback = z_lookback if z_lookback else len(s_up_to)
+                        s_window_20d_ago = s_up_to.iloc[max(0, val_20d_ago_idx - lookback):val_20d_ago_idx]
+                        if len(s_window_20d_ago) > 10:
+                            pctile_20d_ago = float((s_window_20d_ago < val_20d_ago).mean())
+                            pctile_delta = pctile - pctile_20d_ago
+                            momentum_bonus = math.tanh(pctile_delta * 6) * 0.25
+
                 weight = item['weight']
-                raw = z * weight if item['higher_is_bullish'] else -z * weight
-                factor_score = max(min(raw, weight * 3), -weight * 3)
+                direction = 1 if item['higher_is_bullish'] else -1
+                combined_signal = max(min(signal + momentum_bonus * direction, 1.0), -1.0)
+                factor_score = combined_signal * weight * direction
 
                 cg = item.get('cluster_group', ticker)
                 if cg not in cluster_factor_data:
@@ -1195,6 +1233,142 @@ def compute_rolling_scores(historical_data, n_days=50, z_lookback=None):
     if not daily_scores:
         return pd.Series(dtype=float)
     return pd.Series(daily_scores).sort_index()
+
+
+def compute_return_distribution(historical_data, rolling_scores_series, horizons=[20, 60],
+                                live_score=None):
+    """Compute forward gold return distributions conditioned on fixed score bins.
+
+    Uses semantically meaningful score bins anchored to the -1 to +1 scale,
+    rather than dynamic quintiles.  This ensures that a "neutral" score (+0.03)
+    always maps to the Neutral bin, regardless of the historical score distribution.
+
+    Fixed bins:
+        1  Bearish        -1.00 to -0.30
+        2  Mildly Bearish -0.30 to -0.05
+        3  Neutral        -0.05 to +0.05
+        4  Mildly Bullish +0.05 to +0.30
+        5  Bullish        +0.30 to +1.00
+
+    Args:
+        live_score: The regime-adjusted dashboard score for bin placement.
+
+    Returns dict:
+      {horizon: {bin(1-5): {median, mean, p16, p84, hit_rate, n, lo, hi, ...}}}
+    """
+    gc = historical_data.get("GC=F")
+    if gc is None or rolling_scores_series is None or len(rolling_scores_series) < 10:
+        return None
+
+    # Keep FULL daily price series for forward return lookups — the rolling scores
+    # may be sparsely sampled (every 5th day), so we must NOT reindex prices to
+    # the score dates.
+    gc_daily = gc.dropna()
+    scores = rolling_scores_series.dropna()
+    valid_dates = scores.index.intersection(gc_daily.index)
+    if len(valid_dates) < 20:
+        return None
+    scores = scores.loc[valid_dates]
+
+    # Build a positional index for the full daily series so we can jump hz days forward
+    gc_date_to_pos = {d: i for i, d in enumerate(gc_daily.index)}
+
+    # Fixed semantic bins (edges and labels)
+    BIN_EDGES = [-1.01, -0.30, -0.05, 0.05, 0.30, 1.01]
+    BIN_LABELS = [1, 2, 3, 4, 5]
+    BIN_RANGES = {
+        1: (-1.00, -0.30),
+        2: (-0.30, -0.05),
+        3: (-0.05, +0.05),
+        4: (+0.05, +0.30),
+        5: (+0.30, +1.00),
+    }
+
+    result = {}
+    current_score = live_score if live_score is not None else (float(scores.iloc[-1]) if len(scores) > 0 else 0.0)
+
+    # Determine current bin from the live score
+    if current_score <= -0.30:
+        current_bin = 1
+    elif current_score <= -0.05:
+        current_bin = 2
+    elif current_score <= 0.05:
+        current_bin = 3
+    elif current_score <= 0.30:
+        current_bin = 4
+    else:
+        current_bin = 5
+
+    for hz in horizons:
+        fwd_returns = {}
+        for dt in scores.index:
+            pos = gc_date_to_pos.get(dt)
+            if pos is None:
+                continue
+            fwd_pos = pos + hz  # hz ACTUAL trading days forward in daily series
+            if fwd_pos >= len(gc_daily):
+                continue
+            price_now = float(gc_daily.iloc[pos])
+            price_fwd = float(gc_daily.iloc[fwd_pos])
+            if price_now <= 0:
+                continue
+            fwd_ret = (price_fwd - price_now) / price_now * 100
+            fwd_returns[dt] = {"score": float(scores.loc[dt]), "return": fwd_ret}
+
+        if len(fwd_returns) < 20:
+            continue
+
+        df_hr = pd.DataFrame.from_dict(fwd_returns, orient="index")
+
+        # Assign fixed bins
+        df_hr["bin"] = pd.cut(df_hr["score"], bins=BIN_EDGES, labels=BIN_LABELS, include_lowest=True)
+
+        # Baseline (unconditional) return
+        all_returns = df_hr["return"]
+        baseline_median = float(all_returns.median())
+        baseline_hit_rate = float((all_returns > 0).mean()) * 100
+
+        bin_stats = {}
+        for b in BIN_LABELS:
+            b_data = df_hr[df_hr["bin"] == b]["return"]
+            n = len(b_data)
+            lo, hi = BIN_RANGES[b]
+            if n < 3:
+                bin_stats[b] = {
+                    "median": 0.0, "mean": 0.0, "p16": 0.0, "p84": 0.0,
+                    "hit_rate": 0.0, "n": n, "lo": lo, "hi": hi,
+                    "excess_median": 0.0, "excess_hit_rate": 0.0,
+                    "insufficient": True,
+                }
+                continue
+            med = float(b_data.median())
+            hit = float((b_data > 0).mean()) * 100
+            bin_stats[b] = {
+                "median": med,
+                "mean": float(b_data.mean()),
+                "p16": float(b_data.quantile(0.16)),
+                "p84": float(b_data.quantile(0.84)),
+                "hit_rate": hit,
+                "n": n,
+                "lo": lo,
+                "hi": hi,
+                "excess_median": med - baseline_median,
+                "excess_hit_rate": hit - baseline_hit_rate,
+                "insufficient": False,
+            }
+
+        result[hz] = {
+            "quintiles": bin_stats,  # keep key name for compatibility
+            "current_quintile": current_bin,
+            "baseline_median": baseline_median,
+            "baseline_hit_rate": baseline_hit_rate,
+        }
+
+    if not result:
+        return None
+    result["current_score"] = current_score
+    result["current_bin"] = current_bin
+    return result
 
 
 def fetch_market_headlines():
@@ -1318,6 +1492,11 @@ def fetch_market_headlines():
 st.title("📊 Market Intelligence: Gold")
 st.markdown(f"**Report Timestamp:** {datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')}")
 
+return_dist_52w = None
+return_dist_13w = None
+_long_scores_52w = pd.Series(dtype=float)
+_long_scores_13w = pd.Series(dtype=float)
+
 with st.spinner("Downloading 5 years of API market history & computing live Z-Scores for all 47 factors..."):
     historical_data = fetch_historical_data()
 
@@ -1376,6 +1555,11 @@ with st.spinner("Downloading 5 years of API market history & computing live Z-Sc
     rolling_scores_52w = compute_rolling_scores(historical_data, n_days=90, z_lookback=252)  # 52w momentum
     rolling_scores_13w = compute_rolling_scores(historical_data, n_days=90, z_lookback=65)   # 13w tactical
 
+    # Compute longer rolling score history for probabilistic outlook (quintile analysis)
+    _long_scores_52w = compute_rolling_scores(historical_data, n_days=750, z_lookback=252, sample_step=5)
+    _long_scores_13w = compute_rolling_scores(historical_data, n_days=750, z_lookback=65, sample_step=5)
+    # Return distribution computation deferred until after live scores are calculated (needs gold_score)
+
     # Fetch market headlines
     headlines = fetch_market_headlines()
 
@@ -1392,6 +1576,121 @@ _weight_lookup = {}
 for indicators in FACTOR_CONFIG.values():
     for item in indicators:
         _weight_lookup[item['ind']] = item['weight']
+
+# ─── Regime Detection & Dynamic Weight Adjustments ────────────────────────────
+# Detect the current macro regime from available data and apply cluster-level
+# weight multipliers. This tilts the model toward factors that matter most
+# in the current environment without changing the base config weights.
+
+_regime_tags = []
+_cluster_regime_multiplier = {}  # {cluster_group: multiplier}
+
+# 1. Rate regime: tightening vs easing vs holding
+#    Use Fed Funds rate 6-month change
+_fedfunds = historical_data.get("FEDFUNDS")
+_rate_regime = "neutral"
+if _fedfunds is not None and len(_fedfunds) > 126:
+    _ff_now = float(_fedfunds.iloc[-1])
+    _ff_6m_ago = float(_fedfunds.iloc[-126])
+    _ff_delta = _ff_now - _ff_6m_ago
+    if _ff_delta > 0.5:
+        _rate_regime = "tightening"
+        _regime_tags.append("Rate Tightening")
+        # Real rates and yield curve matter more during hiking cycles
+        _cluster_regime_multiplier["Real Rates"] = 1.3
+        _cluster_regime_multiplier["Yield Curve"] = 1.2
+        _cluster_regime_multiplier["Inflation Expectations"] = 1.2
+    elif _ff_delta < -0.5:
+        _rate_regime = "easing"
+        _regime_tags.append("Rate Easing")
+        # Global liquidity and credit conditions matter more during easing
+        _cluster_regime_multiplier["Global Liquidity"] = 1.3
+        _cluster_regime_multiplier["Credit Spreads"] = 1.2
+        _cluster_regime_multiplier["Fed Liquidity"] = 1.2
+    else:
+        _regime_tags.append("Rates On Hold")
+
+# 2. Risk regime: risk-on vs risk-off
+#    Use VIX level and credit spreads
+_vix = historical_data.get("^VIX")
+_hy_spreads = historical_data.get("BAMLH0A0HYM2")
+_risk_regime = "neutral"
+if _vix is not None and len(_vix) > 20:
+    _vix_now = float(_vix.iloc[-1])
+    _vix_52w = _vix.iloc[-252:] if len(_vix) > 252 else _vix
+    _vix_pctile = float((_vix_52w < _vix_now).mean())
+    if _vix_pctile > 0.8:  # VIX in top 20% of past year
+        _risk_regime = "risk_off"
+        _regime_tags.append("Risk-Off (VIX Elevated)")
+        # Safe-haven and stress indicators matter more
+        _cluster_regime_multiplier["Volatility"] = _cluster_regime_multiplier.get("Volatility", 1.0) * 1.3
+        _cluster_regime_multiplier["Banking Stress"] = _cluster_regime_multiplier.get("Banking Stress", 1.0) * 1.3
+        _cluster_regime_multiplier["Geopolitical Risk"] = _cluster_regime_multiplier.get("Geopolitical Risk", 1.0) * 1.2
+        _cluster_regime_multiplier["Dollar Strength"] = _cluster_regime_multiplier.get("Dollar Strength", 1.0) * 1.2
+    elif _vix_pctile < 0.2:  # VIX in bottom 20%
+        _risk_regime = "risk_on"
+        _regime_tags.append("Risk-On (Low Vol)")
+        # Relative value and positioning matter more in calm markets
+        _cluster_regime_multiplier["Gold Ratios"] = _cluster_regime_multiplier.get("Gold Ratios", 1.0) * 1.2
+        _cluster_regime_multiplier["COT Positioning"] = _cluster_regime_multiplier.get("COT Positioning", 1.0) * 1.2
+        _cluster_regime_multiplier["Mining Equities"] = _cluster_regime_multiplier.get("Mining Equities", 1.0) * 1.2
+
+# 3. Dollar regime: strong vs weak
+_dxy = historical_data.get("DX=F")
+_dollar_regime = "neutral"
+if _dxy is not None and len(_dxy) > 252:
+    _dxy_now = float(_dxy.iloc[-1])
+    _dxy_52w = _dxy.iloc[-252:]
+    _dxy_pctile = float((_dxy_52w < _dxy_now).mean())
+    _dxy_3m_ago = float(_dxy.iloc[-65]) if len(_dxy) > 65 else _dxy_now
+    _dxy_momentum = (_dxy_now - _dxy_3m_ago) / _dxy_3m_ago * 100
+    if _dxy_pctile > 0.75 and _dxy_momentum > 1.0:
+        _dollar_regime = "strong_trending"
+        _regime_tags.append("Strong Dollar Trend")
+        # Dollar dominates when it's trending strongly
+        _cluster_regime_multiplier["Dollar Strength"] = _cluster_regime_multiplier.get("Dollar Strength", 1.0) * 1.3
+        _cluster_regime_multiplier["Physical Demand Asia"] = _cluster_regime_multiplier.get("Physical Demand Asia", 1.0) * 1.2
+    elif _dxy_pctile < 0.25 and _dxy_momentum < -1.0:
+        _dollar_regime = "weak_trending"
+        _regime_tags.append("Weak Dollar Trend")
+        _cluster_regime_multiplier["Dollar Strength"] = _cluster_regime_multiplier.get("Dollar Strength", 1.0) * 1.3
+        _cluster_regime_multiplier["Global Liquidity"] = _cluster_regime_multiplier.get("Global Liquidity", 1.0) * 1.2
+
+# 4. Commodity/inflation regime: use oil and breakevens
+_oil = historical_data.get("CL=F")
+_be5y = historical_data.get("T5YIE")
+_commodity_regime = "neutral"
+if _oil is not None and len(_oil) > 252:
+    _oil_now = float(_oil.iloc[-1])
+    _oil_52w = _oil.iloc[-252:]
+    _oil_pctile = float((_oil_52w < _oil_now).mean())
+    if _oil_pctile > 0.75:
+        _commodity_regime = "high_commodity"
+        _regime_tags.append("High Commodity Prices")
+        # Gold/Oil ratio and inflation expectations matter more
+        _cluster_regime_multiplier["Inflation Expectations"] = _cluster_regime_multiplier.get("Inflation Expectations", 1.0) * 1.2
+        # Boost the Gold/Oil factor specifically via its cluster
+        _cluster_regime_multiplier["Gold Ratios"] = _cluster_regime_multiplier.get("Gold Ratios", 1.0) * 1.1
+    elif _oil_pctile < 0.25:
+        _commodity_regime = "low_commodity"
+        _regime_tags.append("Low Commodity Prices")
+
+# Apply regime multipliers to weight lookup (create adjusted copy)
+# Map each indicator to its cluster group for regime adjustment
+_indicator_cluster = {}
+for indicators in FACTOR_CONFIG.values():
+    for item in indicators:
+        _indicator_cluster[item['ind']] = item.get('cluster_group', item['ticker'])
+
+_weight_lookup_adjusted = {}
+for ind, base_w in _weight_lookup.items():
+    cg = _indicator_cluster.get(ind, "")
+    multiplier = _cluster_regime_multiplier.get(cg, 1.0)
+    _weight_lookup_adjusted[ind] = base_w * multiplier
+
+# Use adjusted weights for scoring
+_weight_lookup_original = _weight_lookup.copy()
+_weight_lookup = _weight_lookup_adjusted
 
 if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any():
     # For each cluster: compute weighted average of factor scores, and track max weight
@@ -1438,7 +1737,7 @@ if 'Cluster Group' in final_df.columns and final_df['Cluster Group'].notna().any
         cluster_weighted_scores[cg] = cluster_avg * mw
         cluster_weighted_scores_52w[cg] = cluster_avg_52w * mw
         cluster_weighted_scores_13w[cg] = cluster_avg_13w * mw
-        cluster_max_contributions[cg] = mw * mw * 3
+        cluster_max_contributions[cg] = mw * mw  # percentile: max factor_score = ±weight, so max cluster = weight²
 
     overall_score = sum(cluster_weighted_scores.values())
     overall_score_52w = sum(cluster_weighted_scores_52w.values())
@@ -1486,7 +1785,7 @@ else:
     overall_score_52w = final_df.get('Factor Score 52w', final_df['Total Factor Score']).sum()
     overall_score_13w = final_df.get('Factor Score 13w', final_df['Total Factor Score']).sum()
     max_possible_score = sum(
-        item['weight'] * 3
+        item['weight']
         for indicators in FACTOR_CONFIG.values()
         for item in indicators
     )
@@ -1508,14 +1807,12 @@ if cluster_breakdown:
             if len(prev_series) < 10:
                 continue
             prev_val = float(prev_series.iloc[-1])
-            prev_mean = float(prev_series.mean())
-            prev_std = float(prev_series.std())
-            if prev_std == 0:
-                continue
-            z = (prev_val - prev_mean) / prev_std
+            # Percentile rank with asymmetric tanh scoring
+            pctile = float((prev_series < prev_val).mean())
+            signal = math.tanh((pctile - 0.5) * 4)
             w = item['weight']
-            raw = z * w if item['higher_is_bullish'] else -z * w
-            fs = max(min(raw, w * 3), -w * 3)
+            direction = 1 if item['higher_is_bullish'] else -1
+            fs = signal * w * direction
             cg = item.get('cluster_group', ticker)
             if cg not in _prev_cluster_scores:
                 _prev_cluster_scores[cg] = {'weighted_sum': 0.0, 'weight_sum': 0.0, 'max_weight': 0}
@@ -1531,17 +1828,24 @@ if cluster_breakdown:
         mw = cd['max_weight']
         _prev_cluster_scores[cg] = avg * mw  # same as current: cluster_avg * max_weight
 
-# Normalized Gold Score: actual / max, bounded [-1.0, +1.0]
-gold_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
-gold_score = max(min(gold_score, 1.0), -1.0)
+# Structural Score (full history percentile)
+structural_score = overall_score / max_possible_score if max_possible_score > 0 else 0.0
+structural_score = max(min(structural_score, 1.0), -1.0)
 
-# 52-week Momentum Score
-momentum_score = overall_score_52w / max_possible_score if max_possible_score > 0 else 0.0
-momentum_score = max(min(momentum_score, 1.0), -1.0)
+# PRIMARY Gold Score = 52-week Momentum (best backtested window)
+gold_score = overall_score_52w / max_possible_score if max_possible_score > 0 else 0.0
+gold_score = max(min(gold_score, 1.0), -1.0)
 
 # 13-week Tactical Score
 tactical_score = overall_score_13w / max_possible_score if max_possible_score > 0 else 0.0
 tactical_score = max(min(tactical_score, 1.0), -1.0)
+
+# Now compute return distributions using the LIVE scores for quintile placement
+# This ensures the outlook matches the headline score on the dashboard
+return_dist_52w = compute_return_distribution(historical_data, _long_scores_52w, horizons=[20, 60],
+                                              live_score=gold_score)
+return_dist_13w = compute_return_distribution(historical_data, _long_scores_13w, horizons=[20],
+                                              live_score=tactical_score)
 
 def _interpret_score(sc):
     """Return (label, color, emoji) for a normalized score."""
@@ -1557,14 +1861,14 @@ def _interpret_score(sc):
         return "Strong Bearish", "#ef4444", "🔴🔴"
 
 interpretation, interp_color, interp_emoji = _interpret_score(gold_score)
-mom_interpretation, mom_interp_color, mom_interp_emoji = _interpret_score(momentum_score)
+struct_interpretation, struct_interp_color, struct_interp_emoji = _interpret_score(structural_score)
 tac_interpretation, tac_interp_color, tac_interp_emoji = _interpret_score(tactical_score)
 
 # ─── Summary Score Panel ─────────────────────────────────────────────────────
 
-# Gold Score change (from rolling_scores)
-if len(rolling_scores) >= 2:
-    score_prev = float(rolling_scores.iloc[-2])
+# Gold Score change (from rolling_scores_52w — primary score)
+if len(rolling_scores_52w) >= 2:
+    score_prev = float(rolling_scores_52w.iloc[-2])
     score_change = gold_score - score_prev
     if score_change > 0.0005:
         score_chg_str = f"▲ +{score_change:.3f}"
@@ -1583,14 +1887,14 @@ else:
 gauge_pct = (gold_score + 1.0) / 2.0 * 100  # -1 → 0%, 0 → 50%, +1 → 100%
 
 # Generate score history sparkline (wider than indicator sparklines)
-score_sparkline_svg = make_sparkline_svg(rolling_scores, n_days=90, width=180, height=40)
+score_sparkline_svg = make_sparkline_svg(rolling_scores_52w, n_days=90, width=180, height=40)
 
 _summary_html = (
     '<div class="summary-panel">'
     '<div class="summary-flex">'
-    # Big structural score + sparkline
+    # Big 52w score (primary) + sparkline
     '<div class="summary-score-block">'
-    '<div class="summary-label">Structural Score</div>'
+    '<div class="summary-label">Gold Score (52w)</div>'
     f'<div class="summary-score-value" style="color:{interp_color};">{gold_score:+.2f}</div>'
     f'<div class="summary-interp" style="color:{interp_color};">'
     f'{interp_emoji} {interpretation}</div>'
@@ -1600,12 +1904,12 @@ _summary_html = (
     f'{score_sparkline_svg}'
     '</div>'
     '</div>'
-    # 52-week momentum score
+    # Structural score (secondary)
     '<div class="summary-score-block">'
-    '<div class="summary-label">52w Momentum</div>'
-    f'<div class="summary-score-value" style="color:{mom_interp_color};font-size:1.6rem;">{momentum_score:+.2f}</div>'
-    f'<div class="summary-interp" style="color:{mom_interp_color};font-size:0.72rem;">'
-    f'{mom_interp_emoji} {mom_interpretation}</div>'
+    '<div class="summary-label">Structural</div>'
+    f'<div class="summary-score-value" style="color:{struct_interp_color};font-size:1.6rem;">{structural_score:+.2f}</div>'
+    f'<div class="summary-interp" style="color:{struct_interp_color};font-size:0.72rem;">'
+    f'{struct_interp_emoji} {struct_interpretation}</div>'
     '</div>'
     '<div class="summary-score-block">'
     '<div class="summary-label">13w Tactical</div>'
@@ -1613,16 +1917,22 @@ _summary_html = (
     f'<div class="summary-interp" style="color:{tac_interp_color};font-size:0.72rem;">'
     f'{tac_interp_emoji} {tac_interpretation}</div>'
     '</div>'
+    # Regime indicators
+    '<div class="summary-score-block">'
+    '<div class="summary-label">Active Regimes</div>'
+    + (''.join(f'<div style="font-size:0.72rem;color:#a78bfa;margin:3px 0;line-height:1.3;">▸ {tag}</div>' for tag in _regime_tags) if _regime_tags else '<div style="font-size:0.72rem;color:#666;">No active regime shifts</div>')
+    + (f'<div style="font-size:0.6rem;color:#555;margin-top:6px;">{len(_cluster_regime_multiplier)} cluster(s) adjusted</div>' if _cluster_regime_multiplier else '')
+    + '</div>'
     # Score breakdown
     '<div class="summary-breakdown">'
     '<div class="summary-label" style="margin-bottom:10px;">Score Breakdown</div>'
     '<table class="summary-table">'
-    f'<tr><td></td><td class="summary-td-right" style="font-size:0.6rem;color:#666;">Struct.</td>'
-    f'<td class="summary-td-right" style="font-size:0.6rem;color:#666;">52w</td>'
+    f'<tr><td></td><td class="summary-td-right" style="font-size:0.6rem;color:#666;">52w</td>'
+    f'<td class="summary-td-right" style="font-size:0.6rem;color:#666;">Struct.</td>'
     f'<td class="summary-td-right" style="font-size:0.6rem;color:#666;">13w</td></tr>'
     f'<tr><td>Weighted</td>'
-    f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td>'
     f'<td class="summary-td-right" style="font-weight:600;">{overall_score_52w:+.1f}</td>'
+    f'<td class="summary-td-right" style="font-weight:600;">{overall_score:+.1f}</td>'
     f'<td class="summary-td-right" style="font-weight:600;">{overall_score_13w:+.1f}</td></tr>'
     f'<tr><td>Max</td>'
     f'<td class="summary-td-right">±{max_possible_score:.0f}</td>'
@@ -1631,7 +1941,7 @@ _summary_html = (
     f'<tr style="border-top:1px solid #333;">'
     f'<td style="padding-top:6px;">Norm.</td>'
     f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{interp_color};">{gold_score:+.2f}</td>'
-    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{mom_interp_color};">{momentum_score:+.2f}</td>'
+    f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{struct_interp_color};">{structural_score:+.2f}</td>'
     f'<td class="summary-td-right" style="padding-top:6px;font-weight:700;color:{tac_interp_color};">{tactical_score:+.2f}</td></tr>'
     '</table>'
     '</div>'
@@ -1777,8 +2087,74 @@ if _gc is not None and len(_gc) > 200:
         f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
         f'Classic pivot points (H=${_h:,.0f} L=${_l:,.0f} C=${_c:,.0f})</div>'
         '</div>'
-        '</div>'
     )
+
+    # --- Probabilistic Price Outlook (based on backtested score-return relationship) ---
+    _BIN_NAMES = {1: "Bearish", 2: "Mildly Bearish", 3: "Neutral", 4: "Mildly Bullish", 5: "Bullish"}
+    _outlook_html = ""
+    if return_dist_52w is not None and _spot > 0:
+        _outlook_rows = ""
+        _last_cq = 3  # fallback
+        for _hz, _hz_label, _dist in [
+            (20, "20 Day", return_dist_13w),
+            (60, "60 Day", return_dist_52w),
+        ]:
+            if _dist is None or _hz not in _dist:
+                continue
+            _hz_data = _dist[_hz]
+            _cq = _hz_data["current_quintile"]
+            _last_cq = _cq
+            _qs = _hz_data["quintiles"].get(_cq)
+            if _qs is None or _qs.get("insufficient", False):
+                continue
+            _hit = _qs["hit_rate"]
+            _med_ret = _qs["median"]
+            _excess = _qs["excess_median"]
+            _excess_hit = _qs["excess_hit_rate"]
+            _base_med = _hz_data["baseline_median"]
+            _p16 = _qs["p16"]
+            _p84 = _qs["p84"]
+            _price_lo = _spot * (1 + _p16 / 100)
+            _price_hi = _spot * (1 + _p84 / 100)
+            # Signal based on EXCESS return vs baseline — not raw return
+            # This removes the secular bull-market bias
+            _dir_label = "▲ Bullish" if _excess > 0.5 else ("▼ Bearish" if _excess < -0.5 else "— Neutral")
+            _dir_color = "#22c55e" if _excess > 0.5 else ("#ef4444" if _excess < -0.5 else "#facc15")
+            _hit_color = "#22c55e" if _excess_hit > 3 else ("#ef4444" if _excess_hit < -3 else "#facc15")
+            _outlook_rows += (
+                f'<tr style="border-bottom:1px solid #1a1a2e;">'
+                f'<td style="padding:5px 0;font-weight:600;color:#d0d0d0;">{_hz_label}</td>'
+                f'<td style="padding:5px 4px;text-align:center;color:{_dir_color};font-weight:600;">{_dir_label}</td>'
+                f'<td style="padding:5px 4px;text-align:center;font-family:monospace;color:{_hit_color};font-weight:600;">{_hit:.0f}%</td>'
+                f'<td style="padding:5px 4px;text-align:right;font-family:monospace;color:{_dir_color};">{_excess:+.1f}%</td>'
+                f'<td style="padding:5px 4px;text-align:right;font-family:monospace;font-size:0.75rem;color:#999;">'
+                f'${_price_lo:,.0f} – ${_price_hi:,.0f}</td>'
+                f'</tr>'
+            )
+        if _outlook_rows:
+            # Get baseline for footnote
+            _base_note = ""
+            if return_dist_52w and 60 in return_dist_52w:
+                _b60 = return_dist_52w[60].get("baseline_median", 0)
+                _base_note = f' &middot; Baseline 60d: {_b60:+.1f}%'
+            _outlook_html = (
+                '<div class="targets-col">'
+                '<div class="summary-label" style="margin-bottom:8px;">Probabilistic Outlook</div>'
+                '<table class="summary-table">'
+                '<tr style="border-bottom:1px solid #333;">'
+                '<th style="padding:3px 0;text-align:left;color:#888;font-weight:600;">Horizon</th>'
+                '<th style="padding:3px 4px;text-align:center;color:#888;font-weight:600;">Signal</th>'
+                '<th style="padding:3px 4px;text-align:center;color:#888;font-weight:600;">P(↑)</th>'
+                '<th style="padding:3px 4px;text-align:right;color:#888;font-weight:600;">vs Avg</th>'
+                '<th style="padding:3px 4px;text-align:right;color:#888;font-weight:600;font-size:0.7rem;">68% Range</th></tr>'
+                + _outlook_rows
+                + '</table>'
+                f'<div style="font-size:0.58rem;color:#555;margin-top:6px;">'
+                f'Score {gold_score:+.2f} → {_BIN_NAMES.get(_last_cq, "Neutral")}{_base_note} &middot; Not financial advice</div>'
+                '</div>'
+            )
+
+    _targets_html += _outlook_html + '</div>'
 
 _summary_html += _targets_html + (
     f'<div class="summary-footer">'
@@ -1854,13 +2230,13 @@ _CLUSTER_DESCRIPTIONS = {
 }
 
 if cluster_breakdown:
-    # Sort clusters by absolute contribution (largest impact first)
-    _sorted_clusters = sorted(cluster_breakdown.items(), key=lambda x: abs(x[1]['score']), reverse=True)
-    _max_abs_score = max(abs(c['score']) for c in cluster_breakdown.values()) if cluster_breakdown else 1
+    # Sort clusters by absolute 52w contribution (largest impact first)
+    _sorted_clusters = sorted(cluster_breakdown.items(), key=lambda x: abs(x[1].get('score_52w', x[1]['score'])), reverse=True)
+    _max_abs_score = max(abs(c.get('score_52w', c['score'])) for c in cluster_breakdown.values()) if cluster_breakdown else 1
     _cb_rows = ""
     for _cg_name, _cb in _sorted_clusters:
-        _cb_score = _cb['score']
-        _cb_score_52w = _cb.get('score_52w', _cb_score)
+        _cb_score_struct = _cb['score']
+        _cb_score = _cb.get('score_52w', _cb_score_struct)  # 52w is primary
         _cb_max = _cb['max']
         _cb_mw = _cb['max_weight']
         _norm = _cb_score / _cb_max if _cb_max > 0 else 0
@@ -1874,13 +2250,13 @@ if cluster_breakdown:
             _cb_color = "#facc15"
             _cb_dir = "Neutral"
         _cb_score_13w = _cb.get('score_13w', _cb_score)
-        # 52w signal color
-        if _cb_score_52w > 0.5:
-            _cb_52w_color = "#22c55e"
-        elif _cb_score_52w < -0.5:
-            _cb_52w_color = "#ef4444"
+        # Structural signal color
+        if _cb_score_struct > 0.5:
+            _cb_struct_color = "#22c55e"
+        elif _cb_score_struct < -0.5:
+            _cb_struct_color = "#ef4444"
         else:
-            _cb_52w_color = "#facc15"
+            _cb_struct_color = "#facc15"
         # 13w signal color
         if _cb_score_13w > 0.5:
             _cb_13w_color = "#22c55e"
@@ -1888,7 +2264,7 @@ if cluster_breakdown:
             _cb_13w_color = "#ef4444"
         else:
             _cb_13w_color = "#facc15"
-        # Bar: proportional to score relative to largest cluster
+        # Bar: proportional to 52w score relative to largest cluster
         _bar_pct = (abs(_cb_score) / _max_abs_score * 100) if _max_abs_score > 0 else 0
         _bar_pct = max(min(_bar_pct, 100), 1)
         _bar_html = f'<div style="display:flex;align-items:center;gap:4px;"><div style="width:{_bar_pct:.0f}%;height:10px;background:{_cb_color};border-radius:2px;min-width:2px;"></div><span style="font-size:0.7rem;color:#888;">{_cb_score:+.1f}</span></div>'
@@ -1912,8 +2288,8 @@ if cluster_breakdown:
             f'</span></td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:center;">{_cb_mw:.0f}</td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_color};font-weight:600;">{_cb_score:+.1f}</td>'
-            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_52w_color};font-weight:600;">{_cb_score_52w:+.1f}</td>'
-            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_13w_color};font-weight:600;">{_cb_score_13w:+.1f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_struct_color};">{_cb_score_struct:+.1f}</td>'
+            f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;color:{_cb_13w_color};">{_cb_score_13w:+.1f}</td>'
             f'<td style="padding:4px 6px;font-size:0.78rem;text-align:right;">{_cb_max:.0f}</td>'
             f'<td style="padding:4px 6px;width:22%;">{_bar_html}</td>'
             f'<td style="padding:4px 6px;font-size:0.75rem;text-align:center;font-weight:600;">{_chg_str}</td>'
@@ -1942,20 +2318,31 @@ if cluster_breakdown:
         '</style>'
         '<div style="padding:8px 0;">'
         '<div style="font-size:0.82rem;color:#aaa;margin-bottom:12px;line-height:1.5;">'
-        '<b>Scoring Formula:</b> For each factor: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">raw = z_score × weight</code> '
-        '(flipped for bearish-when-high). Capped at <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">±weight×3</code>. '
+        '<b>Scoring Formula:</b> For each factor: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">signal = tanh((percentile − 0.5) × 4)</code> '
+        '(asymmetric — amplifies mid-range, compresses extremes). '
+        '52w/13w add momentum: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">+tanh(Δpctile_20d × 6) × 0.25</code>. '
+        'Then <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">score = signal × weight × direction</code>. '
         'Within each cluster, scores are <b>weight-averaged</b>. Then each cluster contributes '
         '<code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">cluster_avg × max_weight</code> to the total. '
-        f'Structural: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{gold_score:+.3f}</code> · '
-        f'52w: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{momentum_score:+.3f}</code> · '
+        f'<b>52w (primary):</b> <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{gold_score:+.3f}</code> · '
+        f'Struct: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{structural_score:+.3f}</code> · '
         f'13w: <code style="background:#1a1a2e;padding:2px 4px;border-radius:3px;">{tactical_score:+.3f}</code>'
         '</div>'
-        '<table class="factor-table" style="table-layout:auto;">'
+        + (
+            '<div style="font-size:0.78rem;color:#a78bfa;margin-bottom:12px;line-height:1.5;padding:8px 12px;background:rgba(167,139,250,0.08);border-radius:6px;border:1px solid rgba(167,139,250,0.15);">'
+            '<b>Regime Adjustments:</b> '
+            + ' · '.join(f'{tag}' for tag in _regime_tags)
+            + '<br>'
+            + ' · '.join(f'{cg} ×{m:.2f}' for cg, m in sorted(_cluster_regime_multiplier.items()))
+            + '</div>'
+            if _cluster_regime_multiplier else ''
+        )
+        + '<table class="factor-table" style="table-layout:auto;">'
         '<tr>'
         '<th style="padding:5px 6px;text-align:left;">Cluster</th>'
         '<th style="padding:5px 6px;text-align:center;">Wt</th>'
+        '<th style="padding:5px 6px;text-align:right;">Score (52w)</th>'
         '<th style="padding:5px 6px;text-align:right;">Struct.</th>'
-        '<th style="padding:5px 6px;text-align:right;">52w</th>'
         '<th style="padding:5px 6px;text-align:right;">13w</th>'
         '<th style="padding:5px 6px;text-align:right;">Max</th>'
         '<th style="padding:5px 6px;text-align:left;">Contribution</th>'
@@ -1966,8 +2353,8 @@ if cluster_breakdown:
         '<tr style="border-top:2px solid #444;">'
         f'<td style="padding:6px;font-weight:700;">TOTAL</td>'
         f'<td></td>'
-        f'<td style="padding:6px;text-align:right;font-weight:700;color:{interp_color};">{overall_score:+.1f}</td>'
-        f'<td style="padding:6px;text-align:right;font-weight:700;color:{mom_interp_color};">{overall_score_52w:+.1f}</td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;color:{interp_color};">{overall_score_52w:+.1f}</td>'
+        f'<td style="padding:6px;text-align:right;font-weight:700;color:{struct_interp_color};">{overall_score:+.1f}</td>'
         f'<td style="padding:6px;text-align:right;font-weight:700;color:{tac_interp_color};">{overall_score_13w:+.1f}</td>'
         f'<td style="padding:6px;text-align:right;font-weight:700;">{max_possible_score:.0f}</td>'
         f'<td style="padding:6px;font-weight:700;color:{interp_color};">= {gold_score:+.3f}</td>'
@@ -1976,7 +2363,7 @@ if cluster_breakdown:
         '</tr>'
         '</table></div>'
     )
-    with st.expander(f"📊 Score Calculation — {num_clusters} clusters, {total_factors} factors → Struct. {gold_score:+.3f} · 52w {momentum_score:+.3f} · 13w {tactical_score:+.3f}", expanded=False):
+    with st.expander(f"📊 Score Calculation — {num_clusters} clusters, {total_factors} factors → 52w {gold_score:+.3f} · Struct. {structural_score:+.3f} · 13w {tactical_score:+.3f}", expanded=False):
         st.markdown(_calc_html, unsafe_allow_html=True)
 
 # ─── Analyst Forecasts Detail Expander ─────────────────────────────────────
@@ -2043,6 +2430,103 @@ if _analyst_forecasts and _gc is not None and len(_gc) > 200:
             f'Sorted by average forecast ascending.</div>'
         )
         st.markdown(_at_html, unsafe_allow_html=True)
+
+# ─── Score → Return History Expander ────────────────────────────────────────
+if return_dist_52w is not None and _gc is not None:
+    _spot_now = float(_gc.iloc[-1])
+    with st.expander("Score → Return History (Fixed Bin Breakdown)", expanded=False):
+        # Build quintile table for each horizon
+        for _hz, _hz_label, _dist, _score_label in [
+            (60, "60-Day Forward Returns (52w Score)", return_dist_52w, "52w"),
+            (20, "20-Day Forward Returns (13w Score)", return_dist_13w, "13w"),
+        ]:
+            if _dist is None or _hz not in _dist:
+                continue
+            _hz_data = _dist[_hz]
+            _cq = _hz_data["current_quintile"]
+            _qstats = _hz_data["quintiles"]
+
+            _base_med = _hz_data.get("baseline_median", 0)
+            _base_hit = _hz_data.get("baseline_hit_rate", 50)
+            _qt_html = (
+                f'<div style="margin-bottom:18px;">'
+                f'<div style="font-size:0.88rem;font-weight:600;color:#d0d0d0;margin-bottom:6px;">{_hz_label}'
+                f'<span style="font-size:0.72rem;font-weight:400;color:#888;margin-left:12px;">'
+                f'Baseline: median {_base_med:+.1f}%, P(↑) {_base_hit:.0f}%</span></div>'
+                f'<table style="width:100%;border-collapse:collapse;font-size:0.82rem;">'
+                f'<tr style="border-bottom:1px solid #333;">'
+                f'<th style="padding:5px 8px;text-align:left;color:#888;">Score Bin</th>'
+                f'<th style="padding:5px 8px;text-align:left;color:#888;">Score Range</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">Median Return</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">vs Avg</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">P(↑)</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">68% Range</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">Implied Price</th>'
+                f'<th style="padding:5px 8px;text-align:right;color:#888;">N</th>'
+                f'</tr>'
+            )
+            _q_labels = {1: "Bearish", 2: "Mildly Bearish", 3: "Neutral",
+                         4: "Mildly Bullish", 5: "Bullish"}
+            for q in range(1, 6):
+                qs = _qstats.get(q)
+                if qs is None:
+                    continue
+                _is_current = (q == _cq)
+                _bg = "background:rgba(96,165,250,0.12);" if _is_current else ""
+                _marker = " ◀ YOU" if _is_current else ""
+                _insuf = qs.get("insufficient", False)
+                if _insuf:
+                    # Not enough data in this bin
+                    _qt_html += (
+                        f'<tr style="border-bottom:1px solid #1a1a2e;{_bg}">'
+                        f'<td style="padding:5px 8px;font-weight:{"700" if _is_current else "400"};">'
+                        f'{_q_labels.get(q, f"B{q}")}{_marker}</td>'
+                        f'<td style="padding:5px 8px;font-family:monospace;font-size:0.78rem;color:#999;">'
+                        f'{qs.get("lo", 0):+.2f} to {qs.get("hi", 0):+.2f}</td>'
+                        f'<td colspan="5" style="padding:5px 8px;text-align:center;color:#555;font-style:italic;">'
+                        f'Insufficient data (n={qs["n"]})</td>'
+                        f'<td style="padding:5px 8px;text-align:right;color:#888;">{qs["n"]}</td>'
+                        f'</tr>'
+                    )
+                    continue
+                _excess = qs.get("excess_median", 0)
+                _excess_clr = "#22c55e" if _excess > 0.5 else ("#ef4444" if _excess < -0.5 else "#facc15")
+                _ret_clr = "#22c55e" if qs["median"] > 0.3 else ("#ef4444" if qs["median"] < -0.3 else "#facc15")
+                _hit_clr = "#22c55e" if qs["hit_rate"] > 55 else ("#ef4444" if qs["hit_rate"] < 45 else "#facc15")
+                _impl_price = _spot_now * (1 + qs["median"] / 100)
+                _qt_html += (
+                    f'<tr style="border-bottom:1px solid #1a1a2e;{_bg}">'
+                    f'<td style="padding:5px 8px;font-weight:{"700" if _is_current else "400"};">'
+                    f'{_q_labels.get(q, f"B{q}")}{_marker}</td>'
+                    f'<td style="padding:5px 8px;font-family:monospace;font-size:0.78rem;color:#999;">'
+                    f'{qs.get("lo", 0):+.2f} to {qs.get("hi", 0):+.2f}</td>'
+                    f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:{_ret_clr};font-weight:600;">'
+                    f'{qs["median"]:+.1f}%</td>'
+                    f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:{_excess_clr};font-weight:600;">'
+                    f'{_excess:+.1f}%</td>'
+                    f'<td style="padding:5px 8px;text-align:right;font-family:monospace;color:{_hit_clr};">'
+                    f'{qs["hit_rate"]:.0f}%</td>'
+                    f'<td style="padding:5px 8px;text-align:right;font-family:monospace;font-size:0.78rem;color:#999;">'
+                    f'{qs["p16"]:+.1f}% to {qs["p84"]:+.1f}%</td>'
+                    f'<td style="padding:5px 8px;text-align:right;font-family:monospace;">${_impl_price:,.0f}</td>'
+                    f'<td style="padding:5px 8px;text-align:right;color:#888;">{qs["n"]}</td>'
+                    f'</tr>'
+                )
+            _qt_html += '</table></div>'
+            st.markdown(_qt_html, unsafe_allow_html=True)
+
+        st.markdown(
+            '<div style="font-size:0.72rem;color:#666;margin-top:8px;line-height:1.5;">'
+            '<b>How to read:</b> Scores are placed into fixed semantic bins (Bearish to Bullish) '
+            'anchored to the -1 to +1 scale. '
+            '<b>vs Avg</b> = excess return above the unconditional baseline (removes bull-market bias). '
+            'Green = score predicts better-than-average performance; Red = worse-than-average. '
+            '<b>P(↑)</b> = % of times gold rose over the horizon. '
+            '<b>68% Range</b> = 16th–84th percentile of returns (1 std dev equivalent). '
+            'Based on ~3 years of rolling score history. Not financial advice.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
 # ─── Spot Prices Panel ──────────────────────────────────────────────────────
 st.subheader("Spot Precious Metals Prices")
@@ -2119,19 +2603,19 @@ if gc_series is not None and len(rolling_scores) > 3:
     )
     fig.add_trace(
         go.Scatter(
-            x=rolling_scores.index, y=rolling_scores.values,
-            name="Structural", mode="lines",
+            x=rolling_scores_52w.index, y=rolling_scores_52w.values,
+            name="Gold Score (52w)", mode="lines",
             line=dict(color="#60a5fa", width=2),
-            hovertemplate="<b>Structural</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+            hovertemplate="<b>Gold Score (52w)</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
         ),
         secondary_y=True,
     )
     fig.add_trace(
         go.Scatter(
-            x=rolling_scores_52w.index, y=rolling_scores_52w.values,
-            name="52w Momentum", mode="lines",
+            x=rolling_scores.index, y=rolling_scores.values,
+            name="Structural", mode="lines",
             line=dict(color="#a78bfa", width=1.5, dash="dash"),
-            hovertemplate="<b>52w Momentum</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+            hovertemplate="<b>Structural</b><br>%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
         ),
         secondary_y=True,
     )
